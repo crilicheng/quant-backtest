@@ -22,18 +22,19 @@ plt.rcParams["axes.unicode_minus"] = False
 # ============================================================
 # 策略参数
 # ============================================================
-LEVERAGE = 5                # 5 倍杠杆
+LEVERAGE = 10               # 10 倍杠杆
 CAPITAL = 10_000            # 初始本金 $10,000
-RISK_PER_TRADE = 0.02       # 每笔风险 = 本金的 2%
-TP_PRICE_PCT = 0.012        # 止盈：价格涨 1.2%（×5 = 仓位赚 6%）
-SL_PRICE_PCT = 0.005        # 止损：价格跌 0.5%（×5 = 仓位亏 2.5%）
-RSI_PERIOD = 4              # 超短 RSI（4 根 K 线）
-RSI_ENTRY = 18              # 极端超卖才进
-MIN_VOL_SPIKE = 1.5         # 成交量要放大 1.5 倍（恐慌抛售确认）
-TRAILING_STOP = 0.003       # 移动止盈：从最高点回撤 0.3% 就锁定利润
+RISK_PER_TRADE = 0.08       # 每笔风险 = 本金的 8%（激进）
+TP_PRICE_PCT = 0.015        # 止盈：价格涨 1.5%（×10 = 赚 15%）
+SL_PRICE_PCT = 0.004        # 止损：价格跌 0.4%（×10 = 亏 4%）
+RSI_PERIOD = 5              # RSI 周期
+RSI_ENTRY_LONG = 25         # 超卖做多阈值
+RSI_ENTRY_SHORT = 78        # 超买做空阈值
+MIN_VOL_SPIKE = 1.2         # 放量确认（降低门槛）
+TRAILING_STOP = 0.004       # 移动止盈
 MAX_HOLD_BARS = 3           # 最长持仓 3 天
 FEE = 0.0004                # 永续合约手续费 0.04%
-SLIPPAGE = 0.0002           # 滑点 0.02%
+SLIPPAGE = 0.0003           # 滑点 0.03%
 TRADING_DAYS = 365
 
 
@@ -91,49 +92,70 @@ def run_scalping(quick: bool = False):
         # ==== 持仓中：检查平仓 ====
         if in_position:
             bars_held += 1
-            # 用日内最高价更新（模拟盯盘）
             highest_since_entry = max(highest_since_entry, price_high)
+            lowest_since_entry = min(lowest_since_entry, price_low)
 
-            # 未实现盈亏（价格变化）
-            unreal_pnl_pct = (price - entry_price) / entry_price
-            leveraged_pnl = unreal_pnl_pct * LEVERAGE
+            # 价格变化（做多正向，做空反向）
+            price_change = ((price - entry_price) / entry_price)
+            if direction == "short":
+                price_change = -price_change
 
             exit_price = None
             exit_reason = ""
 
-            # ① 硬止损
-            if unreal_pnl_pct <= -SL_PRICE_PCT:
-                exit_price = entry_price * (1 - SL_PRICE_PCT)
-                exit_reason = "止损"
-            # ② 硬止盈
-            elif unreal_pnl_pct >= TP_PRICE_PCT:
-                exit_price = entry_price * (1 + TP_PRICE_PCT)
-                exit_reason = "止盈"
-            # ③ 移动止盈：从最高点回落
-            elif highest_since_entry > entry_price:
-                drawdown_from_peak = (highest_since_entry - price) / entry_price
-                if drawdown_from_peak > TRAILING_STOP and unreal_pnl_pct > 0:
+            if direction == "long":
+                # 做多平仓条件
+                if price_change >= TP_PRICE_PCT:
+                    exit_price = entry_price * (1 + TP_PRICE_PCT)
+                    exit_reason = "止盈"
+                elif price_change <= -SL_PRICE_PCT:
+                    exit_price = entry_price * (1 - SL_PRICE_PCT)
+                    exit_reason = "止损"
+                elif highest_since_entry > entry_price:
+                    dd = (highest_since_entry - price) / entry_price
+                    if dd > TRAILING_STOP and price_change > 0:
+                        exit_price = price
+                        exit_reason = "移动止盈"
+                elif bars_held >= MAX_HOLD_BARS:
                     exit_price = price
-                    exit_reason = "移动止盈"
-            # ④ 超时
-            elif bars_held >= MAX_HOLD_BARS:
-                exit_price = price
-                exit_reason = f"超时{bars_held}天"
-            # ⑤ RSI 过热
-            elif not pd.isna(rsi_val) and rsi_val > 75:
-                exit_price = price
-                exit_reason = f"RSI过热"
+                    exit_reason = f"超时{bars_held}天"
+                elif not pd.isna(rsi_val) and rsi_val > 70:
+                    exit_price = price
+                    exit_reason = "RSI回落"
+            else:
+                # 做空平仓条件
+                if price_change >= TP_PRICE_PCT:
+                    exit_price = entry_price * (1 - TP_PRICE_PCT)
+                    exit_reason = "止盈"
+                elif price_change <= -SL_PRICE_PCT:
+                    exit_price = entry_price * (1 + SL_PRICE_PCT)
+                    exit_reason = "止损"
+                elif lowest_since_entry < entry_price:
+                    rally = (price - lowest_since_entry) / entry_price
+                    if rally > TRAILING_STOP and price_change > 0:
+                        exit_price = price
+                        exit_reason = "移动止盈"
+                elif bars_held >= MAX_HOLD_BARS:
+                    exit_price = price
+                    exit_reason = f"超时{bars_held}天"
+                elif not pd.isna(rsi_val) and rsi_val < 35:
+                    exit_price = price
+                    exit_reason = "RSI回升"
 
             if exit_price is not None:
-                exit_slip = exit_price * (1 - SLIPPAGE)
-                pnl_pct = (exit_slip / entry_price - 1) * LEVERAGE
+                exit_slip = exit_price * (1 - SLIPPAGE if direction == "long" else 1 + SLIPPAGE)
+                if direction == "long":
+                    pnl_pct = (exit_slip / entry_price - 1) * LEVERAGE
+                else:
+                    pnl_pct = (1 - exit_slip / entry_price) * LEVERAGE
                 pnl_dollar = position_value * pnl_pct - position_value * FEE * 2
                 equity += pnl_dollar
                 if equity <= 0:
-                    equity = 0.01  # 爆仓保护
+                    equity = 0.01
+                    break
 
                 trades.append({
-                    "entry_date": entry_date, "exit_date": date,
+                    "dir": direction, "entry_date": entry_date, "exit_date": date,
                     "entry": entry_price, "exit": exit_slip,
                     "pnl_pct": pnl_pct * 100, "pnl_$": pnl_dollar,
                     "reason": exit_reason, "bars": bars_held,
@@ -143,34 +165,40 @@ def run_scalping(quick: bool = False):
 
         # ==== 空仓中：看入场信号 ====
         if not in_position and not pd.isna(rsi_val):
-            # 入场：RSI 极端超卖 + 放量（恐慌抛售 = 抄底机会）
-            panic_sell = rsi_val < RSI_ENTRY and vol_ratio > MIN_VOL_SPIKE
-            # 确认：当前价高于当日最低价（有反弹迹象）
-            reversal = price > price_low * 1.002
+            direction = None
 
-            if panic_sell and reversal:
-                # 仓位计算：风险 = 本金 × 2%，止损价差 = entry × SL_PRICE_PCT
+            # 做多：超卖 + 放量 + 反弹确认
+            long_sig = (rsi_val < RSI_ENTRY_LONG and vol_ratio > MIN_VOL_SPIKE
+                       and price > price_low * 1.003)
+            # 做空：超买 + 放量 + 回落确认
+            short_sig = (rsi_val > RSI_ENTRY_SHORT and vol_ratio > MIN_VOL_SPIKE
+                        and price < price_high * 0.997)
+
+            if long_sig:
+                direction = "long"
+            elif short_sig:
+                direction = "short"
+
+            if direction:
                 risk_amount = equity * RISK_PER_TRADE
-                price_risk = price * SL_PRICE_PCT * LEVERAGE
-                if price_risk > 0:
-                    position_value = risk_amount / (SL_PRICE_PCT * LEVERAGE)
-                else:
-                    position_value = equity * LEVERAGE * 0.5
-
-                # 不能超过可用杠杆
+                price_risk = SL_PRICE_PCT * LEVERAGE
+                position_value = risk_amount / (SL_PRICE_PCT * LEVERAGE) if price_risk > 0 else equity * LEVERAGE * 0.5
                 max_position = equity * LEVERAGE
                 position_value = min(position_value, max_position)
 
-                entry_price = price * (1 + SLIPPAGE)  # 买入滑点
+                entry_price = price * (1 + SLIPPAGE if direction == "long" else 1 - SLIPPAGE)
                 highest_since_entry = entry_price
+                lowest_since_entry = entry_price
                 entry_date = date
                 bars_held = 0
                 in_position = True
 
         # ==== 记录权益 ====
         if in_position:
-            mark_price = price
-            unreal = (mark_price / entry_price - 1) * LEVERAGE
+            if direction == "long":
+                unreal = (price / entry_price - 1) * LEVERAGE
+            else:
+                unreal = (1 - price / entry_price) * LEVERAGE
             total_equity = equity + position_value * unreal
         else:
             total_equity = equity
