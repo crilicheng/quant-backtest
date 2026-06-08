@@ -24,17 +24,18 @@ plt.rcParams["axes.unicode_minus"] = False
 # ============================================================
 LEVERAGE = 10               # 10 倍杠杆
 CAPITAL = 10_000            # 初始本金 $10,000
-RISK_PER_TRADE = 0.08       # 每笔风险 = 本金的 8%（激进）
+RISK_PER_TRADE = 0.05       # 每笔风险 = 本金的 5%
 TP_PRICE_PCT = 0.015        # 止盈：价格涨 1.5%（×10 = 赚 15%）
 SL_PRICE_PCT = 0.004        # 止损：价格跌 0.4%（×10 = 亏 4%）
 RSI_PERIOD = 5              # RSI 周期
 RSI_ENTRY_LONG = 25         # 超卖做多阈值
 RSI_ENTRY_SHORT = 78        # 超买做空阈值
-MIN_VOL_SPIKE = 1.2         # 放量确认（降低门槛）
+MIN_VOL_SPIKE = 1.2         # 放量确认
 TRAILING_STOP = 0.004       # 移动止盈
-MAX_HOLD_BARS = 3           # 最长持仓 3 天
-FEE = 0.0004                # 永续合约手续费 0.04%
-SLIPPAGE = 0.0003           # 滑点 0.03%
+MAX_HOLD_BARS = 3
+FEE = 0.0004
+SLIPPAGE = 0.0003
+WICK_RISK_PCT = 0.08        # 插针概率：高波动日 8% 概率触发
 TRADING_DAYS = 365
 
 
@@ -74,6 +75,7 @@ def run_scalping(quick: bool = False):
     highest_since_entry = 0.0
     bars_held = 0
     in_position = False
+    wick_count = 0
     trades = []
     nav = []
 
@@ -103,44 +105,65 @@ def run_scalping(quick: bool = False):
             exit_price = None
             exit_reason = ""
 
-            if direction == "long":
-                # 做多平仓条件
-                if price_change >= TP_PRICE_PCT:
-                    exit_price = entry_price * (1 + TP_PRICE_PCT)
-                    exit_reason = "止盈"
-                elif price_change <= -SL_PRICE_PCT:
-                    exit_price = entry_price * (1 - SL_PRICE_PCT)
-                    exit_reason = "止损"
-                elif highest_since_entry > entry_price:
-                    dd = (highest_since_entry - price) / entry_price
-                    if dd > TRAILING_STOP and price_change > 0:
+            # ⚡ 插针检查：当日振幅 > 3倍 ATR，可能跳过止损
+            atr_pct = row["atr14"] / price
+            daily_range = (price_high - price_low) / price
+            is_wick_day = daily_range > 1.5 * atr_pct  # 高波动日
+            wick_hit = False
+
+            if is_wick_day and np.random.random() < WICK_RISK_PCT:
+                # 插针深度：2-5倍正常止损距离
+                wick_depth = np.random.uniform(2, 5)
+                if direction == "long" and price_low < entry_price * (1 - SL_PRICE_PCT * wick_depth):
+                    exit_price = entry_price * (1 - SL_PRICE_PCT * wick_depth)
+                    exit_reason = "⚡插针"
+                    wick_hit = True
+                    wick_count += 1
+                elif direction == "short" and price_high > entry_price * (1 + SL_PRICE_PCT * wick_depth):
+                    exit_price = entry_price * (1 + SL_PRICE_PCT * wick_depth)
+                    exit_reason = "⚡插针"
+                    wick_hit = True
+                    wick_count += 1
+
+            if not wick_hit:
+                if direction == "long":
+                    # 做多平仓
+                    if price_change >= TP_PRICE_PCT:
+                        exit_price = entry_price * (1 + TP_PRICE_PCT)
+                        exit_reason = "止盈"
+                    elif price_change <= -SL_PRICE_PCT:
+                        exit_price = entry_price * (1 - SL_PRICE_PCT)
+                        exit_reason = "止损"
+                    elif highest_since_entry > entry_price:
+                        dd = (highest_since_entry - price) / entry_price
+                        if dd > TRAILING_STOP and price_change > 0:
+                            exit_price = price
+                            exit_reason = "移动止盈"
+                    elif bars_held >= MAX_HOLD_BARS:
                         exit_price = price
-                        exit_reason = "移动止盈"
-                elif bars_held >= MAX_HOLD_BARS:
-                    exit_price = price
-                    exit_reason = f"超时{bars_held}天"
-                elif not pd.isna(rsi_val) and rsi_val > 70:
-                    exit_price = price
-                    exit_reason = "RSI回落"
-            else:
-                # 做空平仓条件
-                if price_change >= TP_PRICE_PCT:
-                    exit_price = entry_price * (1 - TP_PRICE_PCT)
-                    exit_reason = "止盈"
-                elif price_change <= -SL_PRICE_PCT:
-                    exit_price = entry_price * (1 + SL_PRICE_PCT)
-                    exit_reason = "止损"
-                elif lowest_since_entry < entry_price:
-                    rally = (price - lowest_since_entry) / entry_price
-                    if rally > TRAILING_STOP and price_change > 0:
+                        exit_reason = f"超时{bars_held}天"
+                    elif not pd.isna(rsi_val) and rsi_val > 70:
                         exit_price = price
-                        exit_reason = "移动止盈"
-                elif bars_held >= MAX_HOLD_BARS:
-                    exit_price = price
-                    exit_reason = f"超时{bars_held}天"
-                elif not pd.isna(rsi_val) and rsi_val < 35:
-                    exit_price = price
-                    exit_reason = "RSI回升"
+                        exit_reason = "RSI回落"
+                else:
+                    # 做空平仓
+                    if price_change >= TP_PRICE_PCT:
+                        exit_price = entry_price * (1 - TP_PRICE_PCT)
+                        exit_reason = "止盈"
+                    elif price_change <= -SL_PRICE_PCT:
+                        exit_price = entry_price * (1 + SL_PRICE_PCT)
+                        exit_reason = "止损"
+                    elif lowest_since_entry < entry_price:
+                        rally = (price - lowest_since_entry) / entry_price
+                        if rally > TRAILING_STOP and price_change > 0:
+                            exit_price = price
+                            exit_reason = "移动止盈"
+                    elif bars_held >= MAX_HOLD_BARS:
+                        exit_price = price
+                        exit_reason = f"超时{bars_held}天"
+                    elif not pd.isna(rsi_val) and rsi_val < 35:
+                        exit_price = price
+                        exit_reason = "RSI回升"
 
             if exit_price is not None:
                 exit_slip = exit_price * (1 - SLIPPAGE if direction == "long" else 1 + SLIPPAGE)
@@ -286,6 +309,7 @@ def run_scalping(quick: bool = False):
     print(f"  最大回撤:         {max_dd*100:.1f}%")
     print(f"  ──────────────────────────────")
     print(f"  交易次数:         {total_trades}")
+    print(f"  插针次数:         {wick_count}")
     print(f"  胜率:             {win_rate*100:.0f}%")
     print(f"  总盈亏:           ${total_pnl:,.0f}")
     print(f"  平均价格盈利:      {avg_win*100:.2f}%")
