@@ -269,3 +269,143 @@ def generate_fake_data(
 
     print(f"[FakeData] 生成完成，{len(stock_data)} 只股票，基准 {len(benchmark)} 行")
     return stock_data, benchmark
+
+
+# ============================================================
+# 美股数据（yfinance，全球都能用）
+# ============================================================
+
+try:
+    import yfinance as yf
+    HAS_YFINANCE = True
+except ImportError:
+    HAS_YFINANCE = False
+
+
+def get_us_stock_pool(top_n: int = 100) -> list[str]:
+    """
+    获取美股股票池：标普500成分股，按市值取前 top_n。
+    """
+    print(f"[Data] 获取标普500成分股（取前 {top_n}）...")
+    try:
+        # 从 Wikipedia 获取标普500成分股
+        sp500 = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
+        tickers = sp500["Symbol"].tolist()
+        # 取前 top_n
+        tickers = tickers[:top_n]
+        print(f"[Data] 美股股票池: {len(tickers)} 只")
+        return tickers
+    except Exception:
+        # 降级：手动指定一些大市值美股
+        fallback = [
+            "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "BRK-B",
+            "JPM", "V", "JNJ", "WMT", "PG", "MA", "UNH", "HD", "BAC", "DIS",
+            "ADBE", "NFLX", "CRM", "AMD", "INTC", "QCOM", "TXN", "PYPL", "CSCO",
+            "CMCSA", "PEP", "COST", "ABT", "CVX", "WFC", "MRK", "ABBV", "AVGO",
+            "ORCL", "ACN", "TMO", "NKE", "DHR", "LLY", "PM", "UPS", "MS", "GS",
+            "BLK", "CAT", "AXP", "SPGI", "T", "VZ",
+        ]
+        print(f"[Data] 降级使用预设列表: {len(fallback)} 只")
+        return fallback[:top_n]
+
+
+def get_us_stock_daily(symbol: str, start: str = START_DATE, end: str = END_DATE) -> pd.DataFrame | None:
+    """
+    用 yfinance 获取单只美股日线数据。
+
+    返回统一的 DataFrame 格式（和 A 股接口一致）。
+    """
+    cache_path = os.path.join(DATA_CACHE_DIR, f"us_{symbol}.csv")
+    if os.path.exists(cache_path):
+        df = pd.read_csv(cache_path, parse_dates=["date"])
+        return df
+
+    # 日期格式转换: YYYYMMDD → YYYY-MM-DD
+    start_fmt = f"{start[:4]}-{start[4:6]}-{start[6:8]}"
+    end_fmt = f"{end[:4]}-{end[4:6]}-{end[6:8]}"
+
+    try:
+        ticker = yf.Ticker(symbol)
+        df = ticker.history(start=start_fmt, end=end_fmt)
+
+        if df.empty:
+            return None
+
+        # 统一列名（yfinance 不同版本列名大小写不同，先全转小写）
+        df = df.reset_index()  # Date index → column
+        df.columns = [c.lower() for c in df.columns]
+
+        # 重命名标准列
+        col_map = {
+            "open": "open", "high": "high", "low": "low",
+            "close": "close", "volume": "volume", "date": "date",
+        }
+        df = df.rename(columns=col_map)
+
+        # 计算缺失列
+        if "amount" not in df.columns or df["amount"].isna().all():
+            df["amount"] = df["close"] * df["volume"]
+        # 美股换手率：用 20 日均量 / 总股本（粗略估计，用成交量相对变化代替）
+        if "turnover" not in df.columns or df["turnover"].isna().all():
+            avg_vol = df["volume"].rolling(20).mean()
+            df["turnover"] = (df["volume"] / avg_vol.replace(0, np.nan)).fillna(1.0) * 2.0  # 缩放到合理范围
+        if "change_pct" not in df.columns or df["change_pct"].isna().all():
+            df["change_pct"] = df["close"].pct_change() * 100
+
+        df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
+
+        # 保留标准列
+        cols = ["date", "open", "high", "low", "close",
+                "volume", "amount", "turnover", "change_pct"]
+        df = df[[c for c in cols if c in df.columns]]
+
+        df.to_csv(cache_path, index=False)
+        return df
+
+    except Exception as e:
+        print(f"  ⚠ 获取 {symbol} 失败: {e}")
+        return None
+
+
+def get_all_us_stocks_data(tickers: list[str]) -> dict[str, pd.DataFrame]:
+    """批量获取美股数据"""
+    ensure_cache_dir()
+    result = {}
+    total = len(tickers)
+    print(f"[Data] 下载 {total} 只美股日线数据（{START_DATE} ~ {END_DATE}）...")
+
+    for i, sym in enumerate(tickers):
+        df = get_us_stock_daily(sym)
+        if df is not None and len(df) > 100:
+            result[sym] = df
+        if (i + 1) % max(1, total // 10) == 0:
+            print(f"  ... {i+1}/{total} (有效 {len(result)})")
+
+    print(f"[Data] 美股数据下载完成: {len(result)} 只有效股票")
+    return result
+
+
+def get_us_benchmark(start: str = START_DATE, end: str = END_DATE) -> pd.DataFrame:
+    """获取标普500指数作为基准"""
+    cache_path = os.path.join(DATA_CACHE_DIR, "benchmark_sp500.csv")
+    if os.path.exists(cache_path):
+        return pd.read_csv(cache_path, parse_dates=["date"])
+
+    start_fmt = f"{start[:4]}-{start[4:6]}-{start[6:8]}"
+    end_fmt = f"{end[:4]}-{end[4:6]}-{end[6:8]}"
+
+    try:
+        sp500 = yf.Ticker("^GSPC")
+        df = sp500.history(start=start_fmt, end=end_fmt)
+        if df.empty:
+            return None
+        df = df.reset_index()
+        df.columns = [c.lower() for c in df.columns]
+        df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
+        df = df[["date", "close"]]
+        df.to_csv(cache_path, index=False)
+        print(f"[Data] 标普500基准: {len(df)} 个交易日")
+        return df
+    except Exception as e:
+        print(f"[Data] ⚠ 获取标普500失败: {e}")
+        return None
