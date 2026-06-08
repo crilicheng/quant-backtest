@@ -110,6 +110,7 @@ def run_scalping(quick: bool = False):
     t0 = time.time()
 
     # ---- 数据 ----
+    np.random.seed(7)   # 固定随机种子（可改为任意整数，不同种子结果不同）
     print("[Scalp] 获取 ETH 数据...")
     df = yf.Ticker("ETH-USD").history(start="2023-01-01", end="2026-06-08")
     df = df.reset_index()
