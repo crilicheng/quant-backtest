@@ -40,7 +40,7 @@ LIMIT_OFFSET = 0.0005        # 限价单挂单偏移 0.05%（挂低买、挂高�
 LIMIT_FILL_PROB = 0.85       # 限价单当日成交概率
 SLIPPAGE = 0.0001            # 限价单滑点极小
 WICK_RISK_PCT = 0.08         # 插针概率
-EVENT_FILTER = True           # 事件日历过滤：FOMC/CPI 日不开仓
+EVENT_FILTER = False          # 事件日历过滤（设为 True 则 FOMC/CPI 日不开仓）
 TRADING_DAYS = 365
 
 # ============================================================
