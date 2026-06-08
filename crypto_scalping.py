@@ -1,7 +1,8 @@
 """
-BTC 杠杆超短线策略
-- 5x 杠杆做 BTC 永续合约
-- RSI 极端超卖抄底，快速止盈
+ETH 杠杆超短线策略
+- 10x 杠杆做 ETH 永续合约（波动比 ETH 大，更适合短线）
+- RSI 极端超卖抄底 + 超买做空
+- 限价单入场，省手续费
 - 紧止损，靠胜率吃饭
 
 用法:
@@ -33,9 +34,12 @@ RSI_ENTRY_SHORT = 78        # 超买做空阈值
 MIN_VOL_SPIKE = 1.2         # 放量确认
 TRAILING_STOP = 0.004       # 移动止盈
 MAX_HOLD_BARS = 3
-FEE = 0.0004
-SLIPPAGE = 0.0003
-WICK_RISK_PCT = 0.08        # 插针概率：高波动日 8% 概率触发
+MAKER_FEE = 0.0002          # 限价单手续费 0.02%（比市价单便宜一半）
+TAKER_FEE = 0.0004           # 市价单手续费 0.04%（没成交时的 fallback）
+LIMIT_OFFSET = 0.0005        # 限价单挂单偏移 0.05%（挂低买、挂高卖）
+LIMIT_FILL_PROB = 0.85       # 限价单当日成交概率
+SLIPPAGE = 0.0001            # 限价单滑点极小
+WICK_RISK_PCT = 0.08         # 插针概率
 TRADING_DAYS = 365
 
 
@@ -53,8 +57,8 @@ def run_scalping(quick: bool = False):
     t0 = time.time()
 
     # ---- 数据 ----
-    print("[Scalp] 获取 BTC 数据...")
-    df = yf.Ticker("BTC-USD").history(start="2023-01-01", end="2026-06-08")
+    print("[Scalp] 获取 ETH 数据...")
+    df = yf.Ticker("ETH-USD").history(start="2023-01-01", end="2026-06-08")
     df = df.reset_index()
     df.columns = [c.lower() for c in df.columns]
     df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
@@ -72,6 +76,7 @@ def run_scalping(quick: bool = False):
     equity = float(CAPITAL)                     # 账户权益
     position_value = 0.0                        # 仓位名义价值
     entry_price = 0.0
+    entry_fee_rate = MAKER_FEE
     highest_since_entry = 0.0
     bars_held = 0
     in_position = False
@@ -166,12 +171,13 @@ def run_scalping(quick: bool = False):
                         exit_reason = "RSI回升"
 
             if exit_price is not None:
-                exit_slip = exit_price * (1 - SLIPPAGE if direction == "long" else 1 + SLIPPAGE)
+                # 限价卖出价 = 平仓价 × (1 + 偏移)（挂高卖）
+                exit_fill = exit_price * (1 + LIMIT_OFFSET if direction == "long" else 1 - LIMIT_OFFSET)
                 if direction == "long":
-                    pnl_pct = (exit_slip / entry_price - 1) * LEVERAGE
+                    pnl_pct = (exit_fill / entry_price - 1) * LEVERAGE
                 else:
-                    pnl_pct = (1 - exit_slip / entry_price) * LEVERAGE
-                pnl_dollar = position_value * pnl_pct - position_value * FEE * 2
+                    pnl_pct = (1 - exit_fill / entry_price) * LEVERAGE
+                pnl_dollar = position_value * pnl_pct - position_value * (MAKER_FEE + entry_fee_rate)
                 equity += pnl_dollar
                 if equity <= 0:
                     equity = 0.01
@@ -179,7 +185,7 @@ def run_scalping(quick: bool = False):
 
                 trades.append({
                     "dir": direction, "entry_date": entry_date, "exit_date": date,
-                    "entry": entry_price, "exit": exit_slip,
+                    "entry": entry_price, "exit": exit_fill,
                     "pnl_pct": pnl_pct * 100, "pnl_$": pnl_dollar,
                     "reason": exit_reason, "bars": bars_held,
                 })
@@ -203,18 +209,24 @@ def run_scalping(quick: bool = False):
                 direction = "short"
 
             if direction:
-                risk_amount = equity * RISK_PER_TRADE
-                price_risk = SL_PRICE_PCT * LEVERAGE
-                position_value = risk_amount / (SL_PRICE_PCT * LEVERAGE) if price_risk > 0 else equity * LEVERAGE * 0.5
-                max_position = equity * LEVERAGE
-                position_value = min(position_value, max_position)
+                # 限价单：挂低 0.05% 买入，85% 概率成交
+                if np.random.random() < LIMIT_FILL_PROB:
+                    risk_amount = equity * RISK_PER_TRADE
+                    price_risk = SL_PRICE_PCT * LEVERAGE
+                    position_value = risk_amount / (SL_PRICE_PCT * LEVERAGE) if price_risk > 0 else equity * LEVERAGE * 0.5
+                    max_position = equity * LEVERAGE
+                    position_value = min(position_value, max_position)
 
-                entry_price = price * (1 + SLIPPAGE if direction == "long" else 1 - SLIPPAGE)
-                highest_since_entry = entry_price
-                lowest_since_entry = entry_price
-                entry_date = date
-                bars_held = 0
-                in_position = True
+                    # 限价买入价 = 市价 × (1 - 偏移)（挂低买）
+                    entry_price = price * (1 - LIMIT_OFFSET if direction == "long" else 1 + LIMIT_OFFSET)
+                    entry_fee_rate = MAKER_FEE  # 限价单 = maker，手续费低
+
+                    highest_since_entry = entry_price
+                    lowest_since_entry = entry_price
+                    entry_date = date
+                    bars_held = 0
+                    in_position = True
+                # 15% 概率没成交 → 等下一个信号
 
         # ==== 记录权益 ====
         if in_position:
@@ -254,8 +266,6 @@ def run_scalping(quick: bool = False):
     avg_win = np.mean([t["pnl_pct"] for t in win_trades]) / LEVERAGE if win_trades else 0
     avg_loss = np.mean([t["pnl_pct"] for t in sell_trades if t["pnl_$"] <= 0]) / LEVERAGE if sell_trades else 0
     avg_bars = np.mean([t["bars"] for t in sell_trades]) if sell_trades else 0
-    total_fees = sum(position_value * FEE * 2 for _ in trades)
-    # 近似
     total_trades = len(trades)
 
     # ---- 画图 ----
@@ -266,14 +276,14 @@ def run_scalping(quick: bool = False):
     ax1.plot(nav_df.index, nav_df["equity"] / CAPITAL,
              label=f"杠杆超短线 (5x)", color="#1f77b4", linewidth=1.5)
     btc_nav = nav_df["price"] / btc_init
-    ax1.plot(nav_df.index, btc_nav, label="BTC 现货持有",
+    ax1.plot(nav_df.index, btc_nav, label="ETH 现货持有",
              color="#ff7f0e", linewidth=1.0, alpha=0.7)
     ax1.axhline(y=1.0, color="gray", linestyle="--", alpha=0.5)
     # 标注交易区间
     for t in trades:
         ax1.axvspan(t["entry_date"], t["exit_date"], alpha=0.1,
                     color="green" if t["pnl_$"] > 0 else "red")
-    ax1.set_title("BTC 杠杆超短线 (5x) · RSI 恐慌抄底", fontsize=14, fontweight="bold")
+    ax1.set_title("ETH 杠杆超短线 (5x) · RSI 恐慌抄底", fontsize=14, fontweight="bold")
     ax1.set_ylabel("净值", fontsize=11)
     ax1.legend(loc="upper left")
     ax1.grid(True, alpha=0.3)
@@ -298,7 +308,7 @@ def run_scalping(quick: bool = False):
     print("[Scalp] 图表已保存: crypto_scalping.png")
 
     print(f"\n{'='*60}")
-    print(f"  BTC 杠杆超短线 (5x) · 绩效报告")
+    print(f"  ETH 杠杆超短线 (10x) · 绩效报告")
     print(f"{'='*60}")
     print(f"  初始本金:       ${CAPITAL:,.0f}")
     print(f"  最终权益:       ${final_eq:,.0f}")
@@ -316,8 +326,8 @@ def run_scalping(quick: bool = False):
     print(f"  平均价格亏损:      {avg_loss*100:.2f}%")
     print(f"  平均持仓:          {avg_bars:.1f} 天")
     print(f"  ──────────────────────────────")
-    print(f"  BTC 现货年化:     {btc_ann*100:.1f}%")
-    print(f"  策略 vs BTC:      {(ann_ret-btc_ann)*100:.1f}%")
+    print(f"  ETH 现货年化:     {btc_ann*100:.1f}%")
+    print(f"  策略 vs ETH:      {(ann_ret-btc_ann)*100:.1f}%")
     print(f"{'='*60}")
 
     print(f"\n  最近 10 笔交易:")
@@ -332,7 +342,7 @@ def run_scalping(quick: bool = False):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="BTC 杠杆超短线")
+    parser = argparse.ArgumentParser(description="ETH 杠杆超短线")
     parser.add_argument("--quick", action="store_true")
     args = parser.parse_args()
     run_scalping(quick=args.quick)
