@@ -1,0 +1,271 @@
+"""
+数据获取模块
+- 用 AkShare 获取 A 股行情数据
+- 支持本地缓存，避免重复下载
+- 返回 pandas DataFrame，统一格式
+"""
+
+import os
+import time
+import pandas as pd
+import numpy as np
+from pathlib import Path
+from datetime import datetime
+
+import akshare as ak
+
+from config import (
+    STOCK_POOL_SIZE, ST_MIN_THRESHOLD, EXCLUDE_ST,
+    START_DATE, END_DATE, BENCHMARK_INDEX, DATA_CACHE_DIR,
+)
+
+
+def ensure_cache_dir():
+    """确保缓存目录存在"""
+    Path(DATA_CACHE_DIR).mkdir(parents=True, exist_ok=True)
+
+
+def get_stock_pool(top_n: int = STOCK_POOL_SIZE) -> list[str]:
+    """
+    获取股票池：A 股全部股票按总市值排序，取前 top_n 只。
+    自动剔除 ST 股和低价股。
+
+    返回：股票代码列表，如 ['000001', '000002', ...]
+    """
+    print(f"[Data] 获取 A 股股票列表（按市值取前 {top_n}）...")
+    df = ak.stock_zh_a_spot_em()
+    # df 列：代码, 名称, 最新价, 涨跌幅, 涨跌额, 成交量, 成交额, 总市值, ...
+
+    # 数据清洗
+    df["总市值"] = pd.to_numeric(df["总市值"], errors="coerce")
+    df["最新价"] = pd.to_numeric(df["最新价"], errors="coerce")
+
+    # 剔除 ST
+    if EXCLUDE_ST:
+        df = df[~df["名称"].str.contains("ST|退市", na=False)]
+
+    # 剔除低价股
+    df = df[df["最新价"] > ST_MIN_THRESHOLD]
+
+    # 剔除市值为空的
+    df = df.dropna(subset=["总市值"])
+
+    # 按市值降序排列，取前 top_n
+    df = df.sort_values("总市值", ascending=False)
+
+    stocks = df["代码"].head(top_n).tolist()
+    print(f"[Data] 股票池大小: {len(stocks)}，"
+          f"市值范围: {df['总市值'].iloc[top_n-1]/1e8:.0f}亿 ~ {df['总市值'].iloc[0]/1e8:.0f}亿")
+
+    return stocks
+
+
+def get_stock_daily(symbol: str, start: str = START_DATE, end: str = END_DATE) -> pd.DataFrame | None:
+    """
+    获取单只股票的日线数据（前复权）。
+
+    参数:
+        symbol: 股票代码，如 '000001'
+        start: 开始日期 'YYYYMMDD'
+        end: 结束日期 'YYYYMMDD'
+
+    返回:
+        DataFrame with columns: date, open, high, low, close, volume, amount, turnover, change_pct
+        失败返回 None
+    """
+    cache_path = os.path.join(DATA_CACHE_DIR, f"{symbol}.csv")
+
+    # 优先读缓存
+    if os.path.exists(cache_path):
+        df = pd.read_csv(cache_path, parse_dates=["date"])
+        return df
+
+    # 从 AkShare 获取
+    try:
+        df = ak.stock_zh_a_hist(
+            symbol=symbol,
+            period="daily",
+            start_date=start,
+            end_date=end,
+            adjust="qfq",  # 前复权
+        )
+        if df is None or df.empty:
+            return None
+
+        # 统一列名
+        df = df.rename(columns={
+            "日期": "date",
+            "开盘": "open",
+            "收盘": "close",
+            "最高": "high",
+            "最低": "low",
+            "成交量": "volume",
+            "成交额": "amount",
+            "换手率": "turnover",
+            "涨跌幅": "change_pct",
+        })
+
+        # 保留需要的列
+        cols = ["date", "open", "high", "low", "close",
+                "volume", "amount", "turnover", "change_pct"]
+        df = df[[c for c in cols if c in df.columns]]
+        df["date"] = pd.to_datetime(df["date"])
+
+        # 写入缓存
+        df.to_csv(cache_path, index=False)
+        return df
+
+    except Exception as e:
+        print(f"  ⚠ 获取 {symbol} 失败: {e}")
+        return None
+
+
+def get_all_stocks_data(stock_list: list[str]) -> dict[str, pd.DataFrame]:
+    """
+    批量获取多只股票日线数据，带限速和进度提示。
+
+    返回: {symbol: DataFrame, ...}
+    """
+    ensure_cache_dir()
+    result = {}
+    total = len(stock_list)
+    print(f"[Data] 下载 {total} 只股票日线数据（{START_DATE} ~ {END_DATE}）...")
+    print(f"[Data] 使用缓存目录: {DATA_CACHE_DIR}")
+
+    for i, symbol in enumerate(stock_list):
+        df = get_stock_daily(symbol)
+        if df is not None and len(df) > 100:  # 至少100个交易日
+            result[symbol] = df
+
+        # 进度提示（每20只或每10%）
+        if (i + 1) % max(1, total // 10) == 0:
+            print(f"  ... {i+1}/{total} (有效 {len(result)})")
+
+        # 限速（避免被 ban），缓存命中时不限速
+        cache_path = os.path.join(DATA_CACHE_DIR, f"{symbol}.csv")
+        if not os.path.exists(cache_path):
+            time.sleep(0.15)
+
+    print(f"[Data] 数据下载完成: {len(result)} 只有效股票")
+    return result
+
+
+def get_benchmark_data(start: str = START_DATE, end: str = END_DATE) -> pd.DataFrame:
+    """
+    获取基准指数日线数据（沪深300）。
+
+    返回: DataFrame with columns: date, close
+    """
+    cache_path = os.path.join(DATA_CACHE_DIR, f"benchmark_{BENCHMARK_INDEX}.csv")
+
+    if os.path.exists(cache_path):
+        df = pd.read_csv(cache_path, parse_dates=["date"])
+        return df
+
+    try:
+        df = ak.stock_zh_index_daily(symbol=f"sh{BENCHMARK_INDEX}")
+        # 列可能不同，重新映射
+        if "date" not in df.columns:
+            df = df.rename(columns={"date": "date"})
+        df = df.rename(columns={c: c.lower() for c in df.columns})
+        if "date" not in df.columns:
+            # 可能日期是 index
+            df = df.reset_index()
+        df = df[["date", "close"]]
+        df["date"] = pd.to_datetime(df["date"])
+
+        # 时间筛选
+        df = df[(df["date"] >= start) & (df["date"] <= end)]
+        df.to_csv(cache_path, index=False)
+        print(f"[Data] 基准数据: {len(df)} 个交易日")
+        return df
+
+    except Exception as e:
+        print(f"[Data] ⚠ 获取基准指数失败: {e}")
+        print("[Data] 将使用等权基准代替")
+        return None
+
+
+# ============================================================
+# 模拟数据生成器（用于无网络/海外环境测试回测逻辑）
+# ============================================================
+
+def generate_fake_data(
+    n_stocks: int = 50,
+    start: str = START_DATE,
+    end: str = END_DATE,
+    seed: int = 42,
+) -> tuple[dict[str, pd.DataFrame], pd.DataFrame]:
+    """
+    生成模拟的股票日线数据 + 基准数据。
+    用几何布朗运动生成价格，加入随机漂移和波动率，模拟真实市场。
+
+    参数:
+        n_stocks: 股票数量
+        start, end: 日期范围
+        seed: 随机种子（保证可复现）
+
+    返回:
+        (stock_data_dict, benchmark_df)
+    """
+    np.random.seed(seed)
+    dates = pd.date_range(start=start, end=end, freq="B")  # 仅交易日
+    print(f"[FakeData] 生成 {n_stocks} 只股票的模拟数据，{len(dates)} 个交易日...")
+
+    stock_data = {}
+
+    for i in range(n_stocks):
+        symbol = f"60{i:04d}"  # 600000, 600001, ...
+
+        # 每只股票有不同的漂移率和波动率
+        mu = np.random.uniform(-0.05, 0.20) / 252       # 年化 -5% ~ +20%
+        sigma = np.random.uniform(0.20, 0.50) / np.sqrt(252)  # 年化波动 20%~50%
+
+        # 几何布朗运动
+        returns = np.random.normal(mu, sigma, len(dates))
+        prices = 100.0 * np.exp(np.cumsum(returns))
+
+        # 产生 OHLCV
+        close = prices
+        daily_returns = np.diff(close, prepend=close[0]) / (close + 1e-10)
+        daily_returns[0] = 0
+
+        high = close * (1 + np.abs(np.random.normal(0, 0.015, len(dates))))
+        low = close * (1 - np.abs(np.random.normal(0, 0.015, len(dates))))
+        open_price = close * (1 + np.random.normal(0, 0.005, len(dates)))
+        volume = np.random.lognormal(15, 1.5, len(dates)).astype(int)
+        amount = close * volume
+
+        # 确保 OHLC 关系正确
+        for j in range(len(dates)):
+            o, h, l, c = open_price[j], high[j], low[j], close[j]
+            all_vals = [o, h, l, c]
+            high[j] = max(all_vals)
+            low[j] = min(all_vals)
+
+        df = pd.DataFrame({
+            "date": dates,
+            "open": open_price,
+            "high": high,
+            "low": low,
+            "close": close,
+            "volume": volume,
+            "amount": amount,
+            "turnover": np.random.uniform(0.5, 5.0, len(dates)),
+            "change_pct": daily_returns * 100,
+        })
+
+        stock_data[symbol] = df
+
+    # 生成基准数据（模拟沪深300走势）
+    bench_mu = 0.03 / 252           # 年化 3%
+    bench_sigma = 0.20 / np.sqrt(252)  # 年化波动 20%
+    bench_returns = np.random.normal(bench_mu, bench_sigma, len(dates))
+    bench_prices = 1000.0 * np.exp(np.cumsum(bench_returns))
+    benchmark = pd.DataFrame({
+        "date": dates,
+        "close": bench_prices,
+    })
+
+    print(f"[FakeData] 生成完成，{len(stock_data)} 只股票，基准 {len(benchmark)} 行")
+    return stock_data, benchmark

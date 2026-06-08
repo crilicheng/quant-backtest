@@ -1,0 +1,7 @@
+venv/
+__pycache__/
+*.pyc
+cache/
+backtest_nav.csv
+backtest_trades.csv
+.DS_Store
