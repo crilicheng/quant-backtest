@@ -409,3 +409,54 @@ def get_us_benchmark(start: str = START_DATE, end: str = END_DATE) -> pd.DataFra
     except Exception as e:
         print(f"[Data] ⚠ 获取标普500失败: {e}")
         return None
+
+
+# ============================================================
+# 加密货币数据（yfinance，24/7 交易）
+# ============================================================
+
+CRYPTO_LIST = [
+    "BTC-USD", "ETH-USD", "BNB-USD", "SOL-USD", "XRP-USD",
+    "ADA-USD", "DOGE-USD", "AVAX-USD", "DOT-USD", "MATIC-USD",
+    "LINK-USD", "UNI-USD", "ATOM-USD", "LTC-USD", "ETC-USD",
+    "FIL-USD", "APT-USD", "ARB-USD", "OP-USD", "NEAR-USD",
+    "INJ-USD", "TIA-USD", "SEI-USD", "SUI-USD", "RUNE-USD",
+    "STX-USD", "IMX-USD", "GRT-USD", "SAND-USD", "MANA-USD",
+    "AAVE-USD", "MKR-USD", "SNX-USD", "CRV-USD", "COMP-USD",
+    "ALGO-USD", "FTM-USD", "EGLD-USD", "FLOW-USD", "AXS-USD",
+    "GALA-USD", "KAVA-USD", "ICP-USD", "QNT-USD", "RPL-USD",
+    "LDO-USD", "ENS-USD", "PENDLE-USD", "CFX-USD", "MASK-USD",
+]
+
+
+def get_crypto_pool(top_n: int = 50) -> list[str]:
+    """获取加密货币列表（按市值排序的前 N 个）"""
+    tickers = CRYPTO_LIST[:top_n]
+    print(f"[Data] 加密货币池: {len(tickers)} 个币种")
+    return tickers
+
+
+def get_crypto_benchmark(start: str = START_DATE, end: str = END_DATE) -> pd.DataFrame | None:
+    """获取 BTC 作为加密货币基准"""
+    cache_path = os.path.join(DATA_CACHE_DIR, "benchmark_btc.csv")
+    if os.path.exists(cache_path):
+        return pd.read_csv(cache_path, parse_dates=["date"])
+
+    start_fmt = f"{start[:4]}-{start[4:6]}-{start[6:8]}"
+    end_fmt = f"{end[:4]}-{end[4:6]}-{end[6:8]}"
+
+    try:
+        btc = yf.Ticker("BTC-USD")
+        df = btc.history(start=start_fmt, end=end_fmt)
+        if df.empty:
+            return None
+        df = df.reset_index()
+        df.columns = [c.lower() for c in df.columns]
+        df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
+        df = df[["date", "close"]]
+        df.to_csv(cache_path, index=False)
+        print(f"[Data] BTC基准: {len(df)} 个交易日")
+        return df
+    except Exception as e:
+        print(f"[Data] ⚠ 获取BTC失败: {e}")
+        return None

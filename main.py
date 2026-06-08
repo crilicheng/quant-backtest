@@ -4,9 +4,10 @@
 用法:
     python main.py           # A股真实数据（需要东方财富网络）
     python main.py --us      # 美股真实数据（标普500，全球能用）
+    python main.py --crypto  # 加密货币数据（50个主流币种）
     python main.py --fake    # 模拟数据（不需要网络，验证逻辑）
-    python main.py --quick   # 快速模式（50只股票）
-    可以组合：python main.py --us --quick
+    python main.py --quick   # 快速模式（50只）
+    可以组合：python main.py --crypto --quick
 """
 
 import argparse
@@ -17,6 +18,8 @@ from data_loader import (
     get_stock_pool, get_all_stocks_data, get_benchmark_data,
     # 美股
     get_us_stock_pool, get_all_us_stocks_data, get_us_benchmark,
+    # 加密货币
+    get_crypto_pool, get_crypto_benchmark,
     # 模拟
     generate_fake_data,
 )
@@ -24,10 +27,14 @@ from backtest import backtest
 from analysis import calculate_stats, plot_results
 
 
-def main(quick: bool = False, fake: bool = False, us: bool = False):
+def main(quick: bool = False, fake: bool = False, us: bool = False, crypto: bool = False):
     t0 = time.time()
-    pool_size = 50 if quick else 100  # 美股100只，A股300只
-    if not us:
+    # 根据模式设置股票池大小
+    if crypto:
+        pool_size = 30 if quick else 50
+    elif us:
+        pool_size = 50 if quick else 100
+    else:
         pool_size = 50 if quick else 300
 
     # ============================================================
@@ -37,18 +44,18 @@ def main(quick: bool = False, fake: bool = False, us: bool = False):
         print("[Main] 模拟数据模式")
         stock_data, benchmark = generate_fake_data(n_stocks=pool_size, seed=42)
 
-    elif us:
-        print("[Main] 美股数据模式（yfinance → 标普500）")
+    elif crypto:
+        print("[Main] 加密货币模式（yfinance → BTC/ETH/...）")
         try:
-            tickers = get_us_stock_pool(top_n=pool_size)
-            stock_data = get_all_us_stocks_data(tickers)
-            benchmark = get_us_benchmark()
+            tickers = get_crypto_pool(top_n=pool_size)
+            stock_data = get_all_us_stocks_data(tickers)  # 复用 yfinance 下载函数
+            benchmark = get_crypto_benchmark()
         except Exception as e:
-            print(f"\n[Main] ⚠ 美股数据获取失败: {e}")
+            print(f"\n[Main] ⚠ 加密货币数据获取失败: {e}")
             print("[Main] 自动切换到模拟数据...")
             stock_data, benchmark = generate_fake_data(n_stocks=pool_size, seed=42)
 
-    else:
+    elif us:
         print("[Main] A股数据模式（AkShare → 沪深300）")
         try:
             stocks = get_stock_pool(top_n=pool_size)
@@ -105,5 +112,7 @@ if __name__ == "__main__":
                         help="模拟数据（不联网也能跑）")
     parser.add_argument("--us", action="store_true",
                         help="美股模式（标普500，yfinance数据源）")
+    parser.add_argument("--crypto", action="store_true",
+                        help="加密货币模式（BTC/ETH等50个主流币种）")
     args = parser.parse_args()
-    main(quick=args.quick, fake=args.fake, us=args.us)
+    main(quick=args.quick, fake=args.fake, us=args.us, crypto=args.crypto)
