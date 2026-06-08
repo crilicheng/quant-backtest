@@ -40,7 +40,60 @@ LIMIT_OFFSET = 0.0005        # 限价单挂单偏移 0.05%（挂低买、挂高�
 LIMIT_FILL_PROB = 0.85       # 限价单当日成交概率
 SLIPPAGE = 0.0001            # 限价单滑点极小
 WICK_RISK_PCT = 0.08         # 插针概率
+EVENT_FILTER = True           # 事件日历过滤：FOMC/CPI 日不开仓
 TRADING_DAYS = 365
+
+# ============================================================
+# 事件日历（高影响力宏观事件日）
+# ============================================================
+import datetime as _dt
+
+def _date(s): return _dt.datetime.strptime(s, "%Y-%m-%d").date()
+
+HIGH_IMPACT_EVENTS = set()
+# FOMC 利率决议日（2023-2026，包含前后各1天缓冲）
+_fomc = [
+    "2023-02-01","2023-03-22","2023-05-03","2023-06-14","2023-07-26",
+    "2023-09-20","2023-11-01","2023-12-13",
+    "2024-01-31","2024-03-20","2024-05-01","2024-06-12","2024-07-31",
+    "2024-09-18","2024-11-07","2024-12-18",
+    "2025-01-29","2025-03-19","2025-05-07","2025-06-18","2025-07-30",
+    "2025-09-17","2025-11-06","2025-12-10",
+    "2026-01-28","2026-03-18",
+]
+for d in _fomc:
+    base = _date(d)
+    for offset in [-1, 0, 1]:  # 前一天、当天、后一天
+        HIGH_IMPACT_EVENTS.add((base + _dt.timedelta(days=offset)).strftime("%Y-%m-%d"))
+
+# CPI 发布日（每月中旬，加前后缓冲）
+_cpi_months = [(y, m) for y in range(2023, 2027) for m in range(1, 13)]
+for y, m in _cpi_months:
+    try:
+        d = _date(f"{y}-{m:02d}-12")
+        HIGH_IMPACT_EVENTS.add(d.strftime("%Y-%m-%d"))
+        HIGH_IMPACT_EVENTS.add((d - _dt.timedelta(days=1)).strftime("%Y-%m-%d"))
+        HIGH_IMPACT_EVENTS.add((d + _dt.timedelta(days=1)).strftime("%Y-%m-%d"))
+    except:
+        pass
+
+# 币圈专属大事件
+_crypto_events = [
+    "2024-01-10","2024-01-11","2024-01-12",  # ETF 批准
+    "2024-04-19","2024-04-20",                # BTC 减半
+    "2024-11-05","2024-11-06",                # 美国大选
+    "2025-01-20","2025-01-21",                # 川普就职
+    "2025-08-05","2025-08-06",                # 加密市场闪崩
+]
+for d in _crypto_events:
+    HIGH_IMPACT_EVENTS.add(d)
+
+print(f"[Event] 事件日历: {len(HIGH_IMPACT_EVENTS)} 个高风险日")
+
+
+def is_event_day(date: pd.Timestamp) -> bool:
+    """检查是否为高影响力事件日"""
+    return EVENT_FILTER and date.strftime("%Y-%m-%d") in HIGH_IMPACT_EVENTS
 
 
 def compute_rsi(close: pd.Series, period: int) -> pd.Series:
@@ -194,6 +247,12 @@ def run_scalping(quick: bool = False):
 
         # ==== 空仓中：看入场信号 ====
         if not in_position and not pd.isna(rsi_val):
+            # 事件日不开新仓（FOMC/CPI/重大消息面）
+            if is_event_day(date):
+                nav.append({"date": date, "equity": equity,
+                           "in_position": False, "price": price})
+                continue
+
             direction = None
 
             # 做多：超卖 + 放量 + 反弹确认
