@@ -15,7 +15,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("bot")
 
 # ==== 策略参数 ====
-LEVERAGE = 10
+LEVERAGE = 100              # 100倍杠杆（紧止损0.4%控风险）
 RISK = 0.03
 TP = 0.015
 SL = 0.004
@@ -25,7 +25,7 @@ RSI_L = 25
 RSI_S = 78
 MIN_VOL = 1.2
 MAX_HOLD_BARS = 3
-MAX_POSITIONS = 1           # 单仓（修正仓位后每仓保证金占70%+，一次开一仓）
+MAX_POSITIONS = 3           # 100x杠杆，每仓保证金$18.5，3仓共占22%
 COINS = ["ETHUSDT", "SOLUSDT", "BNBUSDT", "AVAXUSDT", "DOGEUSDT"]
 SCAN_INTERVAL = 60           # 1分钟扫一次（原来5分钟太慢）
 MAX_DAILY_LOSS = 0.15
