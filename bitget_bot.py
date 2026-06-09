@@ -25,7 +25,7 @@ RSI_L = 25
 RSI_S = 78
 MIN_VOL = 1.2
 MAX_HOLD_BARS = 3
-MAX_POSITIONS = 3
+MAX_POSITIONS = 1           # 单仓（修正仓位后每仓保证金占70%+，一次开一仓）
 COINS = ["ETHUSDT", "SOLUSDT", "BNBUSDT", "AVAXUSDT", "DOGEUSDT"]
 SCAN_INTERVAL = 60           # 1分钟扫一次（原来5分钟太慢）
 MAX_DAILY_LOSS = 0.15
@@ -223,7 +223,7 @@ def run(dry=True):
                         price = sig["price"]
                         # 仓位计算：风险$=本金×3%，名义价值=风险÷(止损%×杠杆)
                         risk_dollar = bal["available"] * RISK
-                        notional = risk_dollar / (SL * LEVERAGE)  # 名义价值
+                        notional = risk_dollar / SL  # 名义价值=风险÷止损%
                         size = round(notional / price, 4)
                         if size > 0:
                             api.set_leverage(coin)
