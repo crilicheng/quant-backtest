@@ -15,7 +15,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("bot")
 
 # ==== 策略参数 ====
-LEVERAGE = 100              # 100倍杠杆（紧止损0.4%控风险）
+LEVERAGE = 100              # 默认杠杆（部分币种自动降到最大）
 RISK = 0.03
 TP = 0.015
 SL = 0.004
@@ -27,6 +27,7 @@ MIN_VOL = 1.2
 MAX_HOLD_BARS = 3
 MAX_POSITIONS = 3           # 100x杠杆，每仓保证金$18.5，3仓共占22%
 COINS = ["ETHUSDT", "SOLUSDT", "BNBUSDT", "AVAXUSDT", "DOGEUSDT"]
+MAX_LEVERAGE = {"ETHUSDT":150,"SOLUSDT":100,"BNBUSDT":75,"AVAXUSDT":75,"DOGEUSDT":75}
 SCAN_INTERVAL = 60           # 1分钟扫一次（原来5分钟太慢）
 MAX_DAILY_LOSS = 0.15
 
@@ -226,7 +227,8 @@ def run(dry=True):
                         notional = risk_dollar / SL  # 名义价值=风险÷止损%
                         size = round(notional / price, 4)
                         if size > 0:
-                            api.set_leverage(coin)
+                            lev = min(LEVERAGE, MAX_LEVERAGE.get(coin, 75))
+                            api.set_leverage(coin, lev)
                             tp_price = price*(1+TP if sig["dir"]=="long" else 1-TP)
                             sl_price = price*(1-SL if sig["dir"]=="long" else 1+SL)
                             # 限价单：挂低买/挂高卖（省手续费）
