@@ -27,7 +27,7 @@ MIN_VOL = 1.2
 MAX_HOLD_BARS = 3
 MAX_POSITIONS = 3
 COINS = ["ETHUSDT", "SOLUSDT", "BNBUSDT", "AVAXUSDT", "DOGEUSDT"]
-SCAN_INTERVAL = 300
+SCAN_INTERVAL = 60           # 1分钟扫一次（原来5分钟太慢）
 MAX_DAILY_LOSS = 0.15
 
 # ==== Bitget HTTP 客户端 ====
@@ -108,32 +108,41 @@ class Bitget:
                    {"symbol":symbol,"marginCoin":"USDT","leverage":str(lev),
                     "productType":"USDT-FUTURES","marginMode":"crossed"})
 
-    def market_order(self, symbol, side, size, tp=None, sl_price=None, trail=None):
-        """side: 'buy'开多 'sell'开空
-           tp/sl_price: 硬止盈止损（交易所预设单）
-           trail: 移动止盈回调比例（如 0.004 = 0.4%）"""
+    def limit_order(self, symbol, side, size, limit_price, tp=None, sl_price=None):
+        """限价单开仓：挂低买/挂高卖，省 taker fee + spread
+           如果60秒不成交就撤单换市价"""
+        if side == "buy":
+            order_side = "buy"
+        else:
+            order_side = "sell"
+
         body = {"symbol":symbol,"marginCoin":"USDT","size":str(size),
-                "side":side,"orderType":"market",
-                "productType":"USDT-FUTURES","marginMode":"crossed"}
+                "side":order_side,"orderType":"limit","price":str(limit_price),
+                "productType":"USDT-FUTURES","marginMode":"crossed",
+                "timeInForceValue":"GTC"}
         if tp: body["presetTakeProfitPrice"] = str(tp)
         if sl_price: body["presetStopLossPrice"] = str(sl_price)
+
         if self.dry:
-            logger.info(f"  [模拟] {side} {size} @ {symbol}")
-            return {"code":"00000"}
-        # 下主单
+            logger.info(f"  [模拟] limit {side} {size}@{limit_price} {symbol}")
+            return {"code":"00000","data":{"orderId":"mock"}}
+
         r = self._post("/api/v2/mix/order/place-order", body)
-        # 如果开了移动止盈，单独挂一个追踪止损单
-        if trail and r.get("code") == "00000":
-            trail_body = {
-                "symbol": symbol, "marginCoin": "USDT",
-                "triggerPrice": str(tp) if tp else "0",
-                "side": "sell" if side == "buy" else "buy",
-                "size": str(size), "orderType": "market",
-                "productType": "USDT-FUTURES", "marginMode": "crossed",
-                "rangeRate": str(trail),  # 回调比例
-            }
-            # Bitget V2 移动止盈接口
-            self._post("/api/v2/mix/order/place-trailing-stop", trail_body)
+        if r.get("code") == "00000":
+            order_id = r.get("data", {}).get("orderId", "")
+            if order_id:
+                # 等30秒检查是否成交，没成的话撤单并市价买
+                import time
+                time.sleep(30)
+                check = self._post("/api/v2/mix/order/detail", {"symbol":symbol,"orderId":str(order_id)})
+                if check.get("code") == "00000":
+                    state = check.get("data", {}).get("state", "")
+                    if state != "filled":
+                        # 没成交，撤单换市价
+                        self._post("/api/v2/mix/order/cancel-order", {"symbol":symbol,"orderId":str(order_id)})
+                        body["orderType"] = "market"
+                        body["price"] = "0"
+                        r = self._post("/api/v2/mix/order/place-order", body)
         return r
 
     def close_position(self, symbol, side, size):
@@ -215,10 +224,12 @@ def run(dry=True):
                             api.set_leverage(coin)
                             tp_price = price*(1+TP if sig["dir"]=="long" else 1-TP)
                             sl_price = price*(1-SL if sig["dir"]=="long" else 1+SL)
+                            # 限价单：挂低 0.05% 买 / 挂高 0.05% 卖（省手续费 + 吃价差）
+                            limit_price = round(price*(1-0.0005 if sig["dir"]=="long" else 1+0.0005), 6)
                             side = "buy" if sig["dir"]=="long" else "sell"
-                            r = api.market_order(coin, side, size, tp=tp_price, sl_price=sl_price, trail=TRAIL)
+                            r = api.limit_order(coin, side, size, limit_price, tp=tp_price, sl_price=sl_price)
                             if r.get("code")=="00000":
-                                logger.info(f"✅ {coin} {sig['dir']} | 名义${notional:.0f} | 保证金${notional/LEVERAGE:.0f} | 最大亏损${risk_dollar:.0f} | {price_fmt(price)}→止盈{price_fmt(tp_price)} 止损{price_fmt(sl_price)} 移动止盈{TRAIL*100:.1f}%")
+                                logger.info(f"✅ {coin} {sig['dir']} | 名义${notional:.0f} | 保证金${notional/LEVERAGE:.0f} | 最大亏损${risk_dollar:.0f} | 限价{price_fmt(limit_price)}→止盈{price_fmt(tp_price)} 止损{price_fmt(sl_price)}")
                             else:
                                 logger.error(f"❌ 开仓失败: {r}")
                         time.sleep(1)
