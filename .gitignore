@@ -5,3 +5,5 @@ cache/
 backtest_nav.csv
 backtest_trades.csv
 .DS_Store
+bot.log
+run_bot.sh
