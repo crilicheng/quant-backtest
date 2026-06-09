@@ -142,6 +142,14 @@ def compute_rsi(close, period=RSI_P):
     if al.iloc[-1]==0: return 100.0 if ag.iloc[-1]>0 else 50.0
     return float(100-100/(1+ag.iloc[-1]/al.iloc[-1]))
 
+def price_fmt(p):
+    """自适应价格精度"""
+    if p < 1: return f"${p:.5f}"
+    elif p < 10: return f"${p:.4f}"
+    elif p < 100: return f"${p:.3f}"
+    elif p < 1000: return f"${p:.2f}"
+    else: return f"${p:.2f}"
+
 def check_signal(api, symbol):
     df = api.candles(symbol)
     if len(df)<50: return None
@@ -152,10 +160,10 @@ def check_signal(api, symbol):
     vr = float(v.iloc[-1]/vm.iloc[-1]) if vm.iloc[-1]>0 else 1
     if pd.isna(rsi): return None
     if rsi<RSI_L and vr>MIN_VOL and price>float(l.iloc[-1])*1.003:
-        logger.info(f"📈 {symbol} LONG  RSI={rsi:.0f} Vol={vr:.1f}x Price=${price:.2f}")
+        logger.info(f"📈 {symbol} LONG  RSI={rsi:.0f} Vol={vr:.1f}x {price_fmt(price)}")
         return {"dir":"long","price":price,"rsi":rsi}
     if rsi>RSI_S and vr>MIN_VOL and price<float(h.iloc[-1])*0.997:
-        logger.info(f"📉 {symbol} SHORT RSI={rsi:.0f} Vol={vr:.1f}x Price=${price:.2f}")
+        logger.info(f"📉 {symbol} SHORT RSI={rsi:.0f} Vol={vr:.1f}x {price_fmt(price)}")
         return {"dir":"short","price":price,"rsi":rsi}
     return None
 
@@ -182,7 +190,10 @@ def run(dry=True):
                     sig = check_signal(api, coin)
                     if sig:
                         price = sig["price"]
-                        size = round(bal["available"]*RISK/(SL*LEVERAGE)/price, 4)
+                        # 仓位计算：风险$=本金×3%，名义价值=风险÷(止损%×杠杆)
+                        risk_dollar = bal["available"] * RISK
+                        notional = risk_dollar / (SL * LEVERAGE)  # 名义价值
+                        size = round(notional / price, 4)
                         if size > 0:
                             api.set_leverage(coin)
                             tp_price = price*(1+TP if sig["dir"]=="long" else 1-TP)
@@ -190,7 +201,7 @@ def run(dry=True):
                             side = "buy" if sig["dir"]=="long" else "sell"
                             r = api.market_order(coin, side, size, tp=tp_price, sl_price=sl_price)
                             if r.get("code")=="00000":
-                                logger.info(f"✅ 已开仓 {coin} {sig['dir']} size={size}")
+                                logger.info(f"✅ {coin} {sig['dir']} | 名义${notional:.0f} | 保证金${notional/LEVERAGE:.0f} | 最大亏损${risk_dollar:.0f} | {price_fmt(price)}→止盈{price_fmt(tp_price)} 止损{price_fmt(sl_price)}")
                             else:
                                 logger.error(f"❌ 开仓失败: {r}")
                         time.sleep(1)
