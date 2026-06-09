@@ -108,8 +108,10 @@ class Bitget:
                    {"symbol":symbol,"marginCoin":"USDT","leverage":str(lev),
                     "productType":"USDT-FUTURES","marginMode":"crossed"})
 
-    def market_order(self, symbol, side, size, tp=None, sl_price=None):
-        """side: 'buy'开多 'sell'开空"""
+    def market_order(self, symbol, side, size, tp=None, sl_price=None, trail=None):
+        """side: 'buy'开多 'sell'开空
+           tp/sl_price: 硬止盈止损（交易所预设单）
+           trail: 移动止盈回调比例（如 0.004 = 0.4%）"""
         body = {"symbol":symbol,"marginCoin":"USDT","size":str(size),
                 "side":side,"orderType":"market",
                 "productType":"USDT-FUTURES","marginMode":"crossed"}
@@ -118,7 +120,21 @@ class Bitget:
         if self.dry:
             logger.info(f"  [模拟] {side} {size} @ {symbol}")
             return {"code":"00000"}
-        return self._post("/api/v2/mix/order/place-order", body)
+        # 下主单
+        r = self._post("/api/v2/mix/order/place-order", body)
+        # 如果开了移动止盈，单独挂一个追踪止损单
+        if trail and r.get("code") == "00000":
+            trail_body = {
+                "symbol": symbol, "marginCoin": "USDT",
+                "triggerPrice": str(tp) if tp else "0",
+                "side": "sell" if side == "buy" else "buy",
+                "size": str(size), "orderType": "market",
+                "productType": "USDT-FUTURES", "marginMode": "crossed",
+                "rangeRate": str(trail),  # 回调比例
+            }
+            # Bitget V2 移动止盈接口
+            self._post("/api/v2/mix/order/place-trailing-stop", trail_body)
+        return r
 
     def close_position(self, symbol, side, size):
         """平仓"""
@@ -144,10 +160,11 @@ def compute_rsi(close, period=RSI_P):
 
 def price_fmt(p):
     """自适应价格精度"""
-    if p < 1: return f"${p:.5f}"
-    elif p < 10: return f"${p:.4f}"
-    elif p < 100: return f"${p:.3f}"
-    elif p < 1000: return f"${p:.2f}"
+    if p < 0.01: return f"${p:.8f}"
+    elif p < 1: return f"${p:.6f}"
+    elif p < 10: return f"${p:.5f}"
+    elif p < 100: return f"${p:.4f}"
+    elif p < 1000: return f"${p:.3f}"
     else: return f"${p:.2f}"
 
 def check_signal(api, symbol):
@@ -199,9 +216,9 @@ def run(dry=True):
                             tp_price = price*(1+TP if sig["dir"]=="long" else 1-TP)
                             sl_price = price*(1-SL if sig["dir"]=="long" else 1+SL)
                             side = "buy" if sig["dir"]=="long" else "sell"
-                            r = api.market_order(coin, side, size, tp=tp_price, sl_price=sl_price)
+                            r = api.market_order(coin, side, size, tp=tp_price, sl_price=sl_price, trail=TRAIL)
                             if r.get("code")=="00000":
-                                logger.info(f"✅ {coin} {sig['dir']} | 名义${notional:.0f} | 保证金${notional/LEVERAGE:.0f} | 最大亏损${risk_dollar:.0f} | {price_fmt(price)}→止盈{price_fmt(tp_price)} 止损{price_fmt(sl_price)}")
+                                logger.info(f"✅ {coin} {sig['dir']} | 名义${notional:.0f} | 保证金${notional/LEVERAGE:.0f} | 最大亏损${risk_dollar:.0f} | {price_fmt(price)}→止盈{price_fmt(tp_price)} 止损{price_fmt(sl_price)} 移动止盈{TRAIL*100:.1f}%")
                             else:
                                 logger.error(f"❌ 开仓失败: {r}")
                         time.sleep(1)
