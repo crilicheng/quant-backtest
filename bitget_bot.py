@@ -112,20 +112,11 @@ class Bitget:
                     "productType":"USDT-FUTURES","marginMode":"crossed"})
 
     def limit_order(self, symbol, side, size, limit_price, tp=None, sl_price=None):
-        """限价单开仓：挂低买/挂高卖，省 taker fee + spread
-           如果60秒不成交就撤单换市价"""
-        if side == "buy":
-            order_side = "buy"
-        else:
-            order_side = "sell"
-
+        """限价单开仓，然后另挂止盈止损单"""
         body = {"symbol":symbol,"marginCoin":"USDT","size":str(size),
-                "side":order_side,"orderType":"limit","price":str(limit_price),
+                "side":side,"orderType":"limit","price":str(limit_price),
                 "productType":"USDT-FUTURES","marginMode":"crossed",
                 "timeInForceValue":"GTC"}
-        if tp: body["presetTakeProfitPrice"] = str(tp)
-        if sl_price: body["presetStopLossPrice"] = str(sl_price)
-
         if self.dry:
             logger.info(f"  [模拟] limit {side} {size}@{limit_price} {symbol}")
             return {"code":"00000","data":{"orderId":"mock"}}
@@ -134,18 +125,29 @@ class Bitget:
         if r.get("code") == "00000":
             order_id = r.get("data", {}).get("orderId", "")
             if order_id:
-                # 等30秒检查是否成交，没成的话撤单并市价买
-                import time
-                time.sleep(30)
-                check = self._post("/api/v2/mix/order/detail", {"symbol":symbol,"orderId":str(order_id)})
+                import time; time.sleep(30)
+                check = self._post("/api/v2/mix/order/detail",
+                                   {"symbol":symbol,"orderId":str(order_id)})
                 if check.get("code") == "00000":
                     state = check.get("data", {}).get("state", "")
                     if state != "filled":
-                        # 没成交，撤单换市价
-                        self._post("/api/v2/mix/order/cancel-order", {"symbol":symbol,"orderId":str(order_id)})
+                        self._post("/api/v2/mix/order/cancel-order",
+                                   {"symbol":symbol,"orderId":str(order_id)})
                         body["orderType"] = "market"
-                        body["price"] = "0"
+                        del body["price"]
                         r = self._post("/api/v2/mix/order/place-order", body)
+
+        # 开仓成功后挂止盈止损（单独 API）
+        if r.get("code") == "00000" and tp and sl_price:
+            tpsl_body = {"symbol":symbol,"marginCoin":"USDT","size":str(size),
+                         "side":"sell" if side=="buy" else "buy",
+                         "orderType":"market","productType":"USDT-FUTURES",
+                         "marginMode":"crossed",
+                         "holdSide":"buy" if side=="buy" else "sell"}
+            self._post("/api/v2/mix/order/place-tpsl-order",
+                       {**tpsl_body,"triggerPrice":str(sl_price),"planType":"loss_plan"})
+            self._post("/api/v2/mix/order/place-tpsl-order",
+                       {**tpsl_body,"triggerPrice":str(tp),"planType":"profit_plan"})
         return r
 
     def close_position(self, symbol, side, size):
