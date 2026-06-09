@@ -105,12 +105,14 @@ class Bitget:
     def set_leverage(self, symbol, lev=LEVERAGE):
         if self.dry: return
         self._post("/api/v2/mix/account/set-leverage",
-                   {"symbol":symbol,"marginCoin":"USDT","leverage":str(lev)})
+                   {"symbol":symbol,"marginCoin":"USDT","leverage":str(lev),
+                    "productType":"USDT-FUTURES","marginMode":"crossed"})
 
     def market_order(self, symbol, side, size, tp=None, sl_price=None):
         """side: 'buy'开多 'sell'开空"""
         body = {"symbol":symbol,"marginCoin":"USDT","size":str(size),
-                "side":side,"orderType":"market"}
+                "side":side,"orderType":"market",
+                "productType":"USDT-FUTURES","marginMode":"crossed"}
         if tp: body["presetTakeProfitPrice"] = str(tp)
         if sl_price: body["presetStopLossPrice"] = str(sl_price)
         if self.dry:
@@ -122,7 +124,8 @@ class Bitget:
         """平仓"""
         close_side = "sell" if side == "long" else "buy"
         body = {"symbol":symbol,"marginCoin":"USDT","side":close_side,
-                "orderType":"market","size":str(size),"reduceOnly":"YES"}
+                "orderType":"market","size":str(size),"reduceOnly":"YES",
+                "productType":"USDT-FUTURES","marginMode":"crossed"}
         if self.dry:
             logger.info(f"  [模拟] 平仓 {symbol} {side}")
             return {"code":"00000"}
@@ -216,6 +219,6 @@ if __name__=="__main__":
         for k in ["BITGET_KEY","BITGET_SECRET","BITGET_PASSPHRASE"]:
             if not os.getenv(k):
                 logger.error(f"请设置环境变量 {k}"); exit(1)
-        print("\n⚠️ 实盘模式！输入 YES 继续:")
-        if input()!="YES": print("取消"); exit()
+        logger.info("⚠️ 实盘模式启动，3秒后开始交易...")
+        time.sleep(3)
     run(dry=dry)

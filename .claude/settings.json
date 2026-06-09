@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(open *)",
+      "Bash(curl -s *)",
+      "WebSearch",
+      "WebFetch"
+    ]
+  }
+}
