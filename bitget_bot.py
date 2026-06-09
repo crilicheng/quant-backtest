@@ -104,6 +104,9 @@ class Bitget:
 
     def set_leverage(self, symbol, lev=LEVERAGE):
         if self.dry: return
+        # 先设单向持仓模式
+        self._post("/api/v2/mix/account/set-position-mode",
+                   {"productType":"USDT-FUTURES","posMode":"one_way_mode"})
         self._post("/api/v2/mix/account/set-leverage",
                    {"symbol":symbol,"marginCoin":"USDT","leverage":str(lev),
                     "productType":"USDT-FUTURES","marginMode":"crossed"})
@@ -224,8 +227,11 @@ def run(dry=True):
                             api.set_leverage(coin)
                             tp_price = price*(1+TP if sig["dir"]=="long" else 1-TP)
                             sl_price = price*(1-SL if sig["dir"]=="long" else 1+SL)
-                            # 限价单：挂低 0.05% 买 / 挂高 0.05% 卖（省手续费 + 吃价差）
-                            limit_price = round(price*(1-0.0005 if sig["dir"]=="long" else 1+0.0005), 6)
+                            # 限价单：挂低买/挂高卖（省手续费）
+                            # 价格精度：BTC 1位 ETH 2位 SOL 2位 DOGE 5位
+                            prec = 1 if "BTC" in coin else (5 if "DOGE" in coin else 2)
+                            limit_offset = 0.0005  # 0.05% 偏移
+                            limit_price = round(price*(1-limit_offset if sig["dir"]=="long" else 1+limit_offset), prec)
                             side = "buy" if sig["dir"]=="long" else "sell"
                             r = api.limit_order(coin, side, size, limit_price, tp=tp_price, sl_price=sl_price)
                             if r.get("code")=="00000":
