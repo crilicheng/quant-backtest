@@ -146,43 +146,42 @@ class Bitget:
                 if order_state in ("filled", "partially_filled"):
                     break
 
-        # 3. 未完全成交 → 撤单 → 补剩余
+        # 3. 未完全成交 → 撤单 → 重查最终成交量 → 补剩余
         if order_state not in ("filled",):
             logger.info(f"{symbol} 限价单60秒未全成交(state={order_state} fill={filled_qty})，撤单")
             cancel_r = self._post("/api/v2/mix/order/cancel-order",
                                   {"symbol":symbol,"marginCoin":"USDT","orderId":str(order_id),
                                    "productType":"USDT-FUTURES"})
-            if cancel_r.get("code") != "00000":
-                # 撤单失败 → 可能已成交更多 → 重查一次
-                time.sleep(2)
-                check2 = self._get(f"/api/v2/mix/order/detail?symbol={symbol}&productType=USDT-FUTURES&orderId={order_id}")
-                if check2.get("code") == "00000":
-                    data2 = check2.get("data", {})
-                    if data2.get("state") in ("filled",):
-                        order_state = "filled"
-                        filled_qty = float(data2.get("baseVolume", 0))
-                    elif data2.get("state") == "partially_filled":
-                        filled_qty = float(data2.get("baseVolume", 0))
-                if order_state not in ("filled",):
-                    logger.error(f"{symbol} 撤单失败且未成交，跳过")
-                    return False
+            # 无论撤单成功与否，都重查最终成交量（撤单前后都可能再成交一部分）
+            time.sleep(2)
+            check2 = self._get(f"/api/v2/mix/order/detail?symbol={symbol}&productType=USDT-FUTURES&orderId={order_id}")
+            if check2.get("code") == "00000":
+                data2 = check2.get("data", {})
+                order_state = data2.get("state", "cancelled")
+                filled_qty = float(data2.get("baseVolume", 0))
+                if order_state in ("filled",):
+                    pass  # 全成交了
+                elif filled_qty > 0:
+                    order_state = "filled"  # 有部分成交 → 视为已成交，跳过补单
 
-        if order_state not in ("filled",):
-            # 市价补单 — 只补剩余！（防 double fill）
-            remaining = float(size) - filled_qty
-            if remaining <= 0:
-                order_state = "filled"  # 已经够了
-            else:
-                logger.info(f"{symbol} 已成交{filled_qty}，市价补{remaining}")
-                time.sleep(1)
-                del body["price"]; del body["force"]
-                body["orderType"] = "market"
-                body["size"] = str(round(remaining, 4))
-                r = self._post("/api/v2/mix/order/place-order", body)
-                if r.get("code") != "00000":
-                    logger.error(f"{symbol} 市价补单失败")
-                    # 已有部分成交，不算完全失败，继续挂 TP/SL
-                time.sleep(2)
+            # 已成交部分必须挂 TP/SL（不管撤单成不成功都不能裸奔）
+            if filled_qty <= 0 and order_state not in ("filled",):
+                logger.error(f"{symbol} 限价单未成交且无仓位，跳过")
+                return False
+
+            # 补剩余
+            if order_state not in ("filled",):
+                remaining = float(size) - filled_qty
+                if remaining > 0:
+                    logger.info(f"{symbol} 已成交{filled_qty}，市价补{remaining}")
+                    time.sleep(1)
+                    del body["price"]; del body["force"]
+                    body["orderType"] = "market"
+                    body["size"] = str(round(remaining, 4))
+                    mr = self._post("/api/v2/mix/order/place-order", body)
+                    if mr.get("code") != "00000":
+                        logger.error(f"{symbol} 市价补单失败 — 但已有部分仓位，继续挂TP/SL")
+                    time.sleep(2)
 
         # 4. 确认持仓
         time.sleep(3)
@@ -270,7 +269,6 @@ def check_signal(api, symbol):
 def run(dry=True):
     api = Bitget(dry=dry)
     bal = api.balance()
-    start_equity = bal["available"]
     start_equity_for_dd = bal.get("equity", bal["available"])  # 日亏按权益算
     logger.info(f"余额: ${bal['available']:.0f} | 持仓: {len(api.positions())} | 扫描: {SCAN_INTERVAL}s")
     count = 0; fail_streak = 0; error_streak = 0
@@ -343,7 +341,7 @@ def run(dry=True):
             count += 1; error_streak = 0
             if count % 6 == 0:
                 b = api.balance()
-                logger.info(f"💼 权益 ${b['available']:.0f} | 持仓 {len(pos)} | #{count}")
+                logger.info(f"💼 权益 ${b.get('equity',b['available']):.0f} | 持仓 {len(pos)} | #{count}")
 
         except KeyboardInterrupt:
             logger.info("用户停止"); break
