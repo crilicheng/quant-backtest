@@ -150,7 +150,9 @@ class Bitget:
         if not filled:
             logger.info(f"限价单60秒未成交，撤单换市价")
             self._post("/api/v2/mix/order/cancel-order",
-                      {"symbol":symbol,"orderId":str(order_id)})
+                      {"symbol":symbol,"marginCoin":"USDT",
+                       "orderId":str(order_id),
+                       "productType":"USDT-FUTURES"})
             time.sleep(1)
             body["orderType"] = "market"
             del body["price"]
@@ -196,10 +198,17 @@ class Bitget:
 
         if sl_ok and tp_ok:
             logger.info(f"✅ TP/SL已挂 {symbol}")
+            return True
         else:
-            logger.error(f"❌ TP/SL挂单失败 {symbol}: 止盈={tp_r.get('code')} 止损={sl_r.get('code')}，请在App手动设")
-
-        return True
+            # TP/SL 挂不上 = 裸奔风险，立刻平仓！
+            logger.error(f"❌ {symbol} TP/SL挂单失败 止盈{tp_r.get('code')} 止损{sl_r.get('code')}，立即平仓保护本金")
+            close_side = "sell" if hold_side == "long" else "buy"
+            self._post("/api/v2/mix/order/place-order",
+                      {"symbol":symbol,"marginCoin":"USDT","side":close_side,
+                       "orderType":"market","size":str(actual_size),
+                       "reduceOnly":"YES","productType":"USDT-FUTURES",
+                       "marginMode":"crossed"})
+            return False
 
     def close_position(self, symbol, side, size):
         """平仓"""
