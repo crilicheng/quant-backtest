@@ -146,42 +146,64 @@ class Bitget:
                 if order_state in ("filled", "partially_filled"):
                     break
 
-        # 3. 未完全成交 → 撤单 → 重查最终成交量 → 补剩余
+        # 3. 未完全成交 → 撤单 → 验证 → 保护已成交部分
         if order_state not in ("filled",):
             logger.info(f"{symbol} 限价单60秒未全成交(state={order_state} fill={filled_qty})，撤单")
-            cancel_r = self._post("/api/v2/mix/order/cancel-order",
-                                  {"symbol":symbol,"marginCoin":"USDT","orderId":str(order_id),
-                                   "productType":"USDT-FUTURES"})
-            # 无论撤单成功与否，都重查最终成交量（撤单前后都可能再成交一部分）
-            time.sleep(2)
-            check2 = self._get(f"/api/v2/mix/order/detail?symbol={symbol}&productType=USDT-FUTURES&orderId={order_id}")
-            if check2.get("code") == "00000":
-                data2 = check2.get("data", {})
-                order_state = data2.get("state", "cancelled")
-                filled_qty = float(data2.get("baseVolume", 0))
-                if order_state in ("filled",):
-                    pass  # 全成交了
-                elif filled_qty > 0:
-                    order_state = "filled"  # 有部分成交 → 视为已成交，跳过补单
 
-            # 已成交部分必须挂 TP/SL（不管撤单成不成功都不能裸奔）
+            # 撤单，最多试两次
+            cancelled = False
+            for attempt in range(2):
+                cancel_r = self._post("/api/v2/mix/order/cancel-order",
+                                      {"symbol":symbol,"marginCoin":"USDT","orderId":str(order_id),
+                                       "productType":"USDT-FUTURES"})
+                time.sleep(2)
+                # 重查最终状态
+                chk = self._get(f"/api/v2/mix/order/detail?symbol={symbol}&productType=USDT-FUTURES&orderId={order_id}")
+                if chk.get("code") == "00000":
+                    d2 = chk.get("data", {})
+                    order_state = d2.get("state", "")
+                    filled_qty = float(d2.get("baseVolume", 0))
+                    if order_state in ("cancelled", "filled"):
+                        cancelled = True
+                        break
+                if cancel_r.get("code") == "00000":
+                    cancelled = True
+                if attempt == 0:
+                    time.sleep(1)
+
+            # 判断结果
+            if not cancelled and order_state not in ("filled", "cancelled"):
+                # 撤单失败 + 订单还活着 → 危险：限价单可能后续成交变成裸仓
+                logger.error(f"{symbol} 撤单失败! state={order_state} filled={filled_qty}")
+                if filled_qty > 0:
+                    # 已有部分成交 → 立即保护这部分，不再补单
+                    logger.warning(f"{symbol} 部分成交{filled_qty}，保护现有仓位不补单")
+                    order_state = "filled"
+                else:
+                    # 没成交也没撤掉 → 再试一次市价单撤不掉，跳过这个币
+                    logger.error(f"{symbol} 订单仍存活且无成交，放弃本轮")
+                    return False
+
+            # 已成交部分不能裸奔：不管撤单结果，只要有仓位就往下走
             if filled_qty <= 0 and order_state not in ("filled",):
-                logger.error(f"{symbol} 限价单未成交且无仓位，跳过")
+                logger.error(f"{symbol} 未成交无仓位，跳过")
                 return False
 
-            # 补剩余
-            if order_state not in ("filled",):
+            # 补剩余（保守策略：有部分成交但撤单成功的才补）
+            if order_state not in ("filled",) and cancelled and filled_qty > 0:
                 remaining = float(size) - filled_qty
-                if remaining > 0:
-                    logger.info(f"{symbol} 已成交{filled_qty}，市价补{remaining}")
+                if remaining > 0.001:
+                    logger.info(f"{symbol} 已成交{filled_qty}，补{round(remaining,4)}")
                     time.sleep(1)
                     del body["price"]; del body["force"]
                     body["orderType"] = "market"
                     body["size"] = str(round(remaining, 4))
                     mr = self._post("/api/v2/mix/order/place-order", body)
                     if mr.get("code") != "00000":
-                        logger.error(f"{symbol} 市价补单失败 — 但已有部分仓位，继续挂TP/SL")
+                        logger.error(f"{symbol} 市价补单失败，但已有仓位保护中")
                     time.sleep(2)
+                else:
+                    order_state = "filled"  # 几乎全成交了，跳过补单
 
         # 4. 确认持仓
         time.sleep(3)
