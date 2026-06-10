@@ -163,7 +163,7 @@ class Bitget:
                     d2 = chk.get("data", {})
                     order_state = d2.get("state", "")
                     filled_qty = float(d2.get("baseVolume", 0))
-                    if order_state in ("cancelled", "filled"):
+                    if "cancel" in order_state or order_state == "filled":
                         cancelled = True
                         break
                 if cancel_r.get("code") == "00000":
@@ -172,17 +172,19 @@ class Bitget:
                     time.sleep(1)
 
             # 判断结果
-            if not cancelled and order_state not in ("filled", "cancelled"):
-                # 撤单失败 + 订单还活着 → 危险：限价单可能后续成交变成裸仓
+            if not cancelled and "cancel" not in order_state and order_state != "filled":
+                # 撤单失败 + 订单还活着 → 活单后续成交 = 裸仓。立即平掉已有仓位跑路
                 logger.error(f"{symbol} 撤单失败! state={order_state} filled={filled_qty}")
                 if filled_qty > 0:
-                    # 已有部分成交 → 立即保护这部分，不再补单
-                    logger.warning(f"{symbol} 部分成交{filled_qty}，保护现有仓位不补单")
-                    order_state = "filled"
-                else:
-                    # 没成交也没撤掉 → 再试一次市价单撤不掉，跳过这个币
-                    logger.error(f"{symbol} 订单仍存活且无成交，放弃本轮")
-                    return False
+                    logger.error(f"{symbol} 有部分成交 + 活单 → 立即平仓避险")
+                    cs = "sell" if side == "buy" else "buy"
+                    close_r = self._post("/api/v2/mix/order/place-order",
+                                         {"symbol":symbol,"marginCoin":"USDT","side":cs,
+                                          "orderType":"market","size":str(filled_qty),
+                                          "reduceOnly":"YES","productType":"USDT-FUTURES",
+                                          "marginMode":"crossed"})
+                    logger.error(f"{symbol} 紧急平仓: {close_r.get('code')} {close_r.get('msg','')}")
+                return False
 
             # 已成交部分不能裸奔：不管撤单结果，只要有仓位就往下走
             if filled_qty <= 0 and order_state not in ("filled",):
