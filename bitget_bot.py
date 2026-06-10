@@ -36,6 +36,7 @@ class Bitget:
 
     def __init__(self, dry=True):
         self.dry = dry
+        self.stop_trading = False
         if not dry:
             self.key = os.getenv("BITGET_KEY")
             self.secret = os.getenv("BITGET_SECRET")
@@ -115,6 +116,39 @@ class Bitget:
             return False
         return True
 
+    def _position_for_symbol(self, symbol):
+        """返回当前真实持仓数量和方向。用于紧急保护，避免用成交回报猜仓位。"""
+        pos_r = self._get("/api/v2/mix/position/all-position?productType=USDT-FUTURES&marginCoin=USDT")
+        if pos_r.get("code") == "00000":
+            for p in pos_r.get("data", []):
+                if p.get("symbol") == symbol and float(p.get("total", 0)) > 0:
+                    return float(p.get("total", 0)), p.get("holdSide", "")
+        return 0.0, ""
+
+    def _order_state(self, symbol, order_id):
+        d = self._get(f"/api/v2/mix/order/detail?symbol={symbol}&productType=USDT-FUTURES&orderId={order_id}")
+        if d.get("code") != "00000":
+            return "", 0.0
+        data = d.get("data", {})
+        return data.get("state", ""), float(data.get("baseVolume", 0))
+
+    def _emergency_close(self, symbol, entry_side, fallback_size=0):
+        actual_size, hold_side = self._position_for_symbol(symbol)
+        if actual_size <= 0:
+            actual_size = float(fallback_size or 0)
+            hold_side = "long" if entry_side == "buy" else "short"
+        if actual_size <= 0:
+            logger.error(f"{symbol} 紧急平仓失败：未能确认持仓数量")
+            return False
+        close_side = "sell" if hold_side == "long" else "buy"
+        close_r = self._post("/api/v2/mix/order/place-order",
+                             {"symbol":symbol,"marginCoin":"USDT","side":close_side,
+                              "orderType":"market","size":str(actual_size),
+                              "reduceOnly":"YES","productType":"USDT-FUTURES",
+                              "marginMode":"crossed"})
+        logger.error(f"{symbol} 紧急平仓: {close_r.get('code')} {close_r.get('msg','')}")
+        return close_r.get("code") == "00000"
+
     def open_with_tpsl(self, symbol, side, size, limit_price, tp, sl_price):
         """限价单开仓 → 确认成交 → 挂TP/SL。失败则平仓返回False"""
         if self.dry:
@@ -176,14 +210,20 @@ class Bitget:
                 # 撤单失败 + 订单还活着 → 活单后续成交 = 裸仓。立即平掉已有仓位跑路
                 logger.error(f"{symbol} 撤单失败! state={order_state} filled={filled_qty}")
                 if filled_qty > 0:
-                    logger.error(f"{symbol} 有部分成交 + 活单 → 立即平仓避险")
-                    cs = "sell" if side == "buy" else "buy"
-                    close_r = self._post("/api/v2/mix/order/place-order",
-                                         {"symbol":symbol,"marginCoin":"USDT","side":cs,
-                                          "orderType":"market","size":str(filled_qty),
-                                          "reduceOnly":"YES","productType":"USDT-FUTURES",
-                                          "marginMode":"crossed"})
-                    logger.error(f"{symbol} 紧急平仓: {close_r.get('code')} {close_r.get('msg','')}")
+                    logger.error(f"{symbol} 有部分成交 + 活单 → 立即按真实持仓平仓避险")
+                    self._emergency_close(symbol, side, filled_qty)
+                # 订单还活着时不能继续交易，后续成交会脱离本次 TP/SL 覆盖。
+                self.stop_trading = True
+                for _ in range(3):
+                    self._post("/api/v2/mix/order/cancel-order",
+                               {"symbol":symbol,"marginCoin":"USDT","orderId":str(order_id),
+                                "productType":"USDT-FUTURES"})
+                    time.sleep(2)
+                    order_state, filled_qty = self._order_state(symbol, order_id)
+                    if "cancel" in order_state or order_state == "filled":
+                        break
+                if "cancel" not in order_state and order_state != "filled":
+                    logger.error(f"{symbol} 活订单仍未消失，已触发停机保护，请手动检查订单 {order_id}")
                 return False
 
             # 已成交部分不能裸奔：不管撤单结果，只要有仓位就往下走
@@ -304,6 +344,8 @@ def run(dry=True):
 
             # === 风控 kill switch ===
             if not dry:
+                if api.stop_trading:
+                    logger.error("触发停机保护，停止开新仓"); break
                 daily_dd = (bal.get("equity", bal["available"]) - start_equity_for_dd) / start_equity_for_dd if start_equity_for_dd > 0 else 0
                 if daily_dd < -DAILY_LOSS_LIMIT:
                     logger.error(f"日亏 {daily_dd:.1%} > {DAILY_LOSS_LIMIT:.0%} 停机"); break
