@@ -105,11 +105,15 @@ class Bitget:
         return []
 
     def set_leverage(self, symbol, lev):
-        if self.dry: return
-        self._post("/api/v2/mix/account/set-position-mode", {"productType":"USDT-FUTURES","posMode":"one_way_mode"})
-        self._post("/api/v2/mix/account/set-leverage",
-                   {"symbol":symbol,"marginCoin":"USDT","leverage":str(lev),
-                    "productType":"USDT-FUTURES","marginMode":"crossed"})
+        if self.dry: return True
+        r1 = self._post("/api/v2/mix/account/set-position-mode", {"productType":"USDT-FUTURES","posMode":"one_way_mode"})
+        r2 = self._post("/api/v2/mix/account/set-leverage",
+                        {"symbol":symbol,"marginCoin":"USDT","leverage":str(lev),
+                         "productType":"USDT-FUTURES","marginMode":"crossed"})
+        if r1.get("code") != "00000" or r2.get("code") != "00000":
+            logger.error(f"设杠杆失败 {symbol}: mode={r1.get('code')} lev={r2.get('code')}")
+            return False
+        return True
 
     def open_with_tpsl(self, symbol, side, size, limit_price, tp, sl_price):
         """限价单开仓 → 确认成交 → 挂TP/SL。失败则平仓返回False"""
@@ -129,41 +133,56 @@ class Bitget:
         order_id = r.get("data", {}).get("orderId", "")
         if not order_id: logger.error("未获取订单ID"); return False
 
-        # 2. 轮询成交 (GET 接口 + productType 查询参数)
-        filled = False
+        # 2. 轮询成交 — 处理 filled / partially_filled
+        order_state = ""
+        filled_qty = 0.0
         for _ in range(12):
             time.sleep(5)
             check = self._get(f"/api/v2/mix/order/detail?symbol={symbol}&productType=USDT-FUTURES&orderId={order_id}")
             if check.get("code") == "00000":
-                if check.get("data", {}).get("state") == "filled":
-                    filled = True; break
+                data = check.get("data", {})
+                order_state = data.get("state", "")
+                filled_qty = float(data.get("baseVolume", 0))
+                if order_state in ("filled", "partially_filled"):
+                    break
 
-        # 3. 未成交 → 撤单 → 检查撤单结果 → 市价补
-        if not filled:
-            logger.info(f"{symbol} 限价单60秒未成交，撤单")
+        # 3. 未完全成交 → 撤单 → 补剩余
+        if order_state not in ("filled",):
+            logger.info(f"{symbol} 限价单60秒未全成交(state={order_state} fill={filled_qty})，撤单")
             cancel_r = self._post("/api/v2/mix/order/cancel-order",
                                   {"symbol":symbol,"marginCoin":"USDT","orderId":str(order_id),
                                    "productType":"USDT-FUTURES"})
             if cancel_r.get("code") != "00000":
-                # 撤单失败 → 可能已成交 → 重新查一次
+                # 撤单失败 → 可能已成交更多 → 重查一次
                 time.sleep(2)
                 check2 = self._get(f"/api/v2/mix/order/detail?symbol={symbol}&productType=USDT-FUTURES&orderId={order_id}")
-                if check2.get("code") == "00000" and check2.get("data", {}).get("state") == "filled":
-                    filled = True
-                else:
+                if check2.get("code") == "00000":
+                    data2 = check2.get("data", {})
+                    if data2.get("state") in ("filled",):
+                        order_state = "filled"
+                        filled_qty = float(data2.get("baseVolume", 0))
+                    elif data2.get("state") == "partially_filled":
+                        filled_qty = float(data2.get("baseVolume", 0))
+                if order_state not in ("filled",):
                     logger.error(f"{symbol} 撤单失败且未成交，跳过")
                     return False
 
-        if not filled:
-            # 市价补单
-            time.sleep(1)
-            del body["price"]; del body["force"]
-            body["orderType"] = "market"
-            r = self._post("/api/v2/mix/order/place-order", body)
-            if r.get("code") != "00000":
-                logger.error(f"{symbol} 市价单失败")
-                return False
-            time.sleep(2)
+        if order_state not in ("filled",):
+            # 市价补单 — 只补剩余！（防 double fill）
+            remaining = float(size) - filled_qty
+            if remaining <= 0:
+                order_state = "filled"  # 已经够了
+            else:
+                logger.info(f"{symbol} 已成交{filled_qty}，市价补{remaining}")
+                time.sleep(1)
+                del body["price"]; del body["force"]
+                body["orderType"] = "market"
+                body["size"] = str(round(remaining, 4))
+                r = self._post("/api/v2/mix/order/place-order", body)
+                if r.get("code") != "00000":
+                    logger.error(f"{symbol} 市价补单失败")
+                    # 已有部分成交，不算完全失败，继续挂 TP/SL
+                time.sleep(2)
 
         # 4. 确认持仓
         time.sleep(3)
@@ -184,7 +203,8 @@ class Bitget:
         close_side = "sell" if hold_side == "long" else "buy"
         tpsl_body = {"symbol":symbol,"marginCoin":"USDT","size":str(actual_size),
                      "holdSide":"buy" if hold_side == "long" else "sell",
-                     "productType":"USDT-FUTURES","planType":"loss_plan"}
+                     "productType":"USDT-FUTURES","planType":"loss_plan",
+                     "triggerType":"mark_price","executePrice":"0"}
 
         sl_r = self._post("/api/v2/mix/order/place-tpsl-order",
                          {**tpsl_body,"triggerPrice":str(sl_price),"planType":"loss_plan"})
@@ -251,6 +271,7 @@ def run(dry=True):
     api = Bitget(dry=dry)
     bal = api.balance()
     start_equity = bal["available"]
+    start_equity_for_dd = bal.get("equity", bal["available"])  # 日亏按权益算
     logger.info(f"余额: ${bal['available']:.0f} | 持仓: {len(api.positions())} | 扫描: {SCAN_INTERVAL}s")
     count = 0; fail_streak = 0; error_streak = 0
 
@@ -261,7 +282,7 @@ def run(dry=True):
 
             # === 风控 kill switch ===
             if not dry:
-                daily_dd = (bal["available"] - start_equity) / start_equity if start_equity > 0 else 0
+                daily_dd = (bal.get("equity", bal["available"]) - start_equity_for_dd) / start_equity_for_dd if start_equity_for_dd > 0 else 0
                 if daily_dd < -DAILY_LOSS_LIMIT:
                     logger.error(f"日亏 {daily_dd:.1%} > {DAILY_LOSS_LIMIT:.0%} 停机"); break
                 if fail_streak >= CONSECUTIVE_FAILS_MAX:
@@ -294,7 +315,9 @@ def run(dry=True):
 
                         if size > 0:
                             lev = min(LEVERAGE, MAX_LEVERAGE.get(coin, 75))
-                            api.set_leverage(coin, lev)
+                            if not api.set_leverage(coin, lev):
+                                logger.error(f"{coin} 设杠杆失败，跳过")
+                                continue
                             side = "buy" if sig["dir"] == "long" else "sell"
                             tp_price = price * (1 + TP if sig["dir"] == "long" else 1 - TP)
                             sl_price = price * (1 - SL if sig["dir"] == "long" else 1 + SL)
@@ -308,8 +331,9 @@ def run(dry=True):
                                 fail_streak = 0
                                 margin = notional / lev
                                 logger.info(f"✅ {coin} {sig['dir']} 名义${notional:.0f} {lev}x保证金${margin:.0f} 风险${risk_dollar:.0f} {price_fmt(price)}→止盈{price_fmt(tp_price)} 止损{price_fmt(sl_price)}")
-                                # 立即刷新持仓 防同轮重复开
+                                # 刷新持仓 + cooldown 防重复
                                 pos = api.positions()
+                                cooldown[coin] = time.time()
                             else:
                                 fail_streak += 1
                                 logger.error(f"❌ {coin} 开仓失败 (连续{fail_streak}次)")
