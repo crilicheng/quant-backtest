@@ -112,44 +112,62 @@ class Bitget:
                    {"symbol":symbol,"marginCoin":"USDT","leverage":str(lev),
                     "productType":"USDT-FUTURES","marginMode":"crossed"})
 
-    def limit_order(self, symbol, side, size, limit_price, tp=None, sl_price=None):
-        """限价单开仓，然后另挂止盈止损单"""
-        body = {"symbol":symbol,"marginCoin":"USDT","size":str(size),
-                "side":side,"orderType":"limit","price":str(limit_price),
-                "productType":"USDT-FUTURES","marginMode":"crossed",
-                "timeInForceValue":"GTC"}
+    def open_with_tpsl(self, symbol, side, size, tp, sl_price):
+        """市价开仓 + 确认成交 + 挂止盈止损（每一步都有验证）"""
         if self.dry:
-            logger.info(f"  [模拟] limit {side} {size}@{limit_price} {symbol}")
-            return {"code":"00000","data":{"orderId":"mock"}}
+            logger.info(f"  [模拟] {side} {size} {symbol} tp={tp} sl={sl_price}")
+            return True
 
+        import time
+        # 1. 市价单开仓（最可靠）
+        body = {"symbol":symbol,"marginCoin":"USDT","size":str(size),
+                "side":side,"orderType":"market",
+                "productType":"USDT-FUTURES","marginMode":"crossed"}
         r = self._post("/api/v2/mix/order/place-order", body)
-        if r.get("code") == "00000":
-            order_id = r.get("data", {}).get("orderId", "")
-            if order_id:
-                import time; time.sleep(30)
-                check = self._post("/api/v2/mix/order/detail",
-                                   {"symbol":symbol,"orderId":str(order_id)})
-                if check.get("code") == "00000":
-                    state = check.get("data", {}).get("state", "")
-                    if state != "filled":
-                        self._post("/api/v2/mix/order/cancel-order",
-                                   {"symbol":symbol,"orderId":str(order_id)})
-                        body["orderType"] = "market"
-                        del body["price"]
-                        r = self._post("/api/v2/mix/order/place-order", body)
+        if r.get("code") != "00000":
+            logger.error(f"开仓失败: {r.get('code')} {r.get('msg','')}")
+            return False
 
-        # 开仓成功后挂止盈止损（单独 API）
-        if r.get("code") == "00000" and tp and sl_price:
-            tpsl_body = {"symbol":symbol,"marginCoin":"USDT","size":str(size),
-                         "side":"sell" if side=="buy" else "buy",
-                         "orderType":"market","productType":"USDT-FUTURES",
-                         "marginMode":"crossed",
-                         "holdSide":"buy" if side=="buy" else "sell"}
-            self._post("/api/v2/mix/order/place-tpsl-order",
-                       {**tpsl_body,"triggerPrice":str(sl_price),"planType":"loss_plan"})
-            self._post("/api/v2/mix/order/place-tpsl-order",
-                       {**tpsl_body,"triggerPrice":str(tp),"planType":"profit_plan"})
-        return r
+        # 2. 等 3 秒确认成交
+        time.sleep(3)
+
+        # 3. 查持仓确认有仓位
+        pos_r = self._get("/api/v2/mix/position/all-position?productType=USDT-FUTURES&marginCoin=USDT")
+        pos_exists = False
+        if pos_r.get("code") == "00000":
+            for p in pos_r.get("data", []):
+                if p["symbol"] == symbol and float(p.get("total", 0)) > 0:
+                    pos_exists = True
+                    # 用实际数量和方向
+                    actual_size = p["total"]
+                    hold_side = p.get("holdSide", "long")
+                    break
+
+        if not pos_exists:
+            logger.error(f"开仓后未检测到 {symbol} 持仓，跳过TP/SL")
+            return True  # 单子开了，只是没挂TP/SL
+
+        # 4. 挂止盈止损
+        close_side = "sell" if hold_side == "long" else "buy"
+        tpsl_body = {"symbol":symbol,"marginCoin":"USDT","size":str(actual_size),
+                     "side":close_side,"orderType":"market",
+                     "productType":"USDT-FUTURES","marginMode":"crossed",
+                     "holdSide":"buy" if hold_side == "long" else "sell"}
+
+        sl_r = self._post("/api/v2/mix/order/place-tpsl-order",
+                         {**tpsl_body,"triggerPrice":str(sl_price),"planType":"loss_plan"})
+        tp_r = self._post("/api/v2/mix/order/place-tpsl-order",
+                         {**tpsl_body,"triggerPrice":str(tp),"planType":"profit_plan"})
+
+        sl_ok = sl_r.get("code") == "00000"
+        tp_ok = tp_r.get("code") == "00000"
+
+        if sl_ok and tp_ok:
+            logger.info(f"✅ TP/SL已挂 {symbol}")
+        else:
+            logger.error(f"❌ TP/SL挂单失败 {symbol}: 止盈={tp_r.get('code')} 止损={sl_r.get('code')}")
+
+        return True
 
     def close_position(self, symbol, side, size):
         """平仓"""
@@ -229,19 +247,20 @@ def run(dry=True):
                         if size > 0:
                             lev = min(LEVERAGE, MAX_LEVERAGE.get(coin, 75))
                             api.set_leverage(coin, lev)
+                            side = "buy" if sig["dir"]=="long" else "sell"
                             tp_price = price*(1+TP if sig["dir"]=="long" else 1-TP)
                             sl_price = price*(1-SL if sig["dir"]=="long" else 1+SL)
-                            # 限价单：挂低买/挂高卖（省手续费）
-                            # 价格精度：BTC 1位 ETH 2位 SOL 2位 DOGE 5位
+                            # 价格取整
                             prec = 1 if "BTC" in coin else (5 if "DOGE" in coin else 2)
-                            limit_offset = 0.0005  # 0.05% 偏移
-                            limit_price = round(price*(1-limit_offset if sig["dir"]=="long" else 1+limit_offset), prec)
-                            side = "buy" if sig["dir"]=="long" else "sell"
-                            r = api.limit_order(coin, side, size, limit_price, tp=tp_price, sl_price=sl_price)
-                            if r.get("code")=="00000":
-                                logger.info(f"✅ {coin} {sig['dir']} | 名义${notional:.0f} | 保证金${notional/LEVERAGE:.0f} | 最大亏损${risk_dollar:.0f} | 限价{price_fmt(limit_price)}→止盈{price_fmt(tp_price)} 止损{price_fmt(sl_price)}")
+                            tp_price = round(tp_price, prec)
+                            sl_price = round(sl_price, prec)
+
+                            ok = api.open_with_tpsl(coin, side, size, tp_price, sl_price)
+                            if ok:
+                                margin = notional / lev
+                                logger.info(f"✅ {coin} {sig['dir']} | 名义${notional:.0f} | {lev}x保证金${margin:.0f} | 最大亏损${risk_dollar:.0f} | {price_fmt(price)}→止盈{price_fmt(tp_price)} 止损{price_fmt(sl_price)}")
                             else:
-                                logger.error(f"❌ 开仓失败: {r}")
+                                logger.error(f"❌ {coin} 开仓失败")
                         time.sleep(1)
 
             count+=1
