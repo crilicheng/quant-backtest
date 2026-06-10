@@ -291,8 +291,9 @@ def run(dry=True):
                             side = "buy" if sig["dir"]=="long" else "sell"
                             tp_price = price*(1+TP if sig["dir"]=="long" else 1-TP)
                             sl_price = price*(1-SL if sig["dir"]=="long" else 1+SL)
-                            # 价格取整
-                            prec = 1 if "BTC" in coin else (5 if "DOGE" in coin else 2)
+                            # 价格取整（合约最小精度）
+                            prec_map = {"BTCUSDT":1,"ETHUSDT":2,"SOLUSDT":3,"BNBUSDT":2,"AVAXUSDT":3,"DOGEUSDT":5}
+                            prec = prec_map.get(coin, 3)
                             tp_price = round(tp_price, prec)
                             sl_price = round(sl_price, prec)
                             # 限价偏移：挂低0.05%买/挂高0.05%卖
