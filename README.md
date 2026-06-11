@@ -166,7 +166,7 @@ python bitget_bot.py --dry-run
 
 ## 👤 作者
 
-AI 专业大二学生，量化方向探索中。
+AI 专业学生，量化方向探索中。
 
 ---
 
