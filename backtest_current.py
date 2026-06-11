@@ -116,5 +116,5 @@ ax2=axes[1]
 dd=(nav_df["equity"]-nav_df["equity"].expanding().max())/nav_df["equity"].expanding().max()
 ax2.fill_between(dd.index,dd.values,0,color="red",alpha=0.3)
 ax2.set_ylabel("回撤");ax2.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1.0));ax2.grid(True,alpha=0.3)
-plt.tight_layout();plt.savefig("backtest_current.png",dpi=150,bbox_inches="tight")
-print("图: backtest_current.png")
+plt.tight_layout();plt.savefig("assets/backtest_current.png",dpi=150,bbox_inches="tight")
+print("图: assets/backtest_current.png")

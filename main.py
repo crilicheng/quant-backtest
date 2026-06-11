@@ -82,7 +82,7 @@ def main(quick: bool = False, fake: bool = False, us: bool = False, crypto: bool
     # 3. 绩效 & 可视化
     # ============================================================
     stats = calculate_stats(nav)
-    plot_results(nav, stats, save_path="backtest_result.png")
+    plot_results(nav, stats, save_path="assets/backtest_result.png")
 
     if len(trades) > 0:
         print(f"\n{'='*70}")
@@ -98,10 +98,10 @@ def main(quick: bool = False, fake: bool = False, us: bool = False, crypto: bool
     # ============================================================
     # 4. 保存
     # ============================================================
-    nav.to_csv("backtest_nav.csv")
-    trades.to_csv("backtest_trades.csv", index=False)
-    print("[Total] 净值 → backtest_nav.csv")
-    print("[Total] 调仓 → backtest_trades.csv")
+    nav.to_csv("assets/backtest_nav.csv")
+    trades.to_csv("assets/backtest_trades.csv", index=False)
+    print("[Total] 净值 → assets/backtest_nav.csv")
+    print("[Total] 调仓 → assets/backtest_trades.csv")
 
 
 if __name__ == "__main__":

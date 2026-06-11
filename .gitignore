@@ -1,9 +1,15 @@
+# 环境
 venv/
 __pycache__/
 *.pyc
-cache/
-backtest_nav.csv
-backtest_trades.csv
 .DS_Store
+.claude/
+
+# 数据缓存
+cache/
+*.csv
+
+# 实盘敏感信息
 bot.log
 run_bot.sh
+*.pem

@@ -1,69 +1,175 @@
-# 多因子选股回测系统
+# 🔬 量化交易系统 | 回测 → 实盘 → 真金白银验证
 
-A-share multi-factor stock selection backtest system. 用 Python 实现经典的量化选股策略，适合作为量化求职的入门项目。
+[![Python](https://img.shields.io/badge/Python-3.10+-blue)](https://www.python.org/)
+[![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
-## 策略逻辑
+一个从回测到实盘的完整量化交易项目，覆盖 **A 股多因子选股** 和 **加密货币期货策略**。
+
+**亮点：加密货币 RSI 策略已在实盘运行，9 笔交易净利 +$31，盈亏比 3:1。**
+
+---
+
+## 🚀 实盘机器人（Bitget 永续合约）
+
+真金白银在跑的 RSI 均值回归策略，部署于阿里云香港服务器，24×7 运行。
+
+### 策略逻辑
+
+```
+RSI(5) < 25 + 放量(>1.2x) + 价格确认 → 限价做多
+RSI(5) > 78 + 放量(>1.2x) + 价格确认 → 限价做空
+止盈 +1.5%  |  止损 -0.4%  |  盈亏比 3.75:1
+```
+
+### 实盘战绩（2026.06.10 – 至今）
+
+| 指标 | 数值 |
+|------|------|
+| 交易笔数 | 9 |
+| 胜率 | 44% |
+| 盈亏比 | **3.0 : 1** |
+| 净利 | **+$31.37** |
+| 手续费 | $7.33（占毛利 16%） |
+| 平均盈利 | +$13.42 |
+| 平均亏损 | -$4.46 |
+
+> 📊 详细记录见 [LIVE_TRADING.md](LIVE_TRADING.md)
+
+### 风控设计
+
+| 机制 | 说明 |
+|------|------|
+| 每日亏损上限 | 亏 20% 自动停机 |
+| 连续失败保护 | 连续 3 次开仓失败停机 |
+| 紧急平仓 | TP/SL 挂单失败立即市价平仓 |
+| 限价单保护 | 60 秒未成交撤单，绝不裸仓 |
+| 最大持仓 | 最多 3 个币种同时持仓 |
+
+### 运行方式
+
+```bash
+# 模拟盘（不实际交易，用 yfinance 模拟数据）
+python bitget_bot.py --dry-run
+
+# 实盘（需要设置环境变量）
+export BITGET_KEY="your_api_key"
+export BITGET_SECRET="your_api_secret"
+export BITGET_PASSPHRASE="your_passphrase"
+python bitget_bot.py --live
+```
+
+---
+
+## 📈 A 股多因子选股回测
+
+沪深 300 成分股，月度调仓，6 因子等权打分。
 
 | 因子 | 方向 | 说明 |
 |------|------|------|
-| 20日动量 | + | 过去20日涨跌幅，追趋势 |
-| 20日波动率 | - | 日收益率波动率（年化），偏好低波 |
-| 20日换手率 | - | 平均换手率，避免过高换手的投机股 |
-| 5日量比 | + | 近期放量的股票有资金关注 |
-| 14日RSI | - | 相对强弱指标，不过热 |
-| 规模因子 | - | 对数市值，小盘股溢价 |
+| 20日动量 | + | 追趋势 |
+| 20日波动率 | − | 偏好低波 |
+| 20日换手率 | − | 避开投机股 |
+| 5日量比 | + | 资金关注 |
+| 14日RSI | − | 不过热 |
+| 规模因子 | − | 小盘溢价 |
 
-- 每月末调仓，等权打分选前 N 只
 - 交易成本 0.35%（含印花税、佣金、滑点）
 - 基准：沪深300
+- 数据源：AkShare
 
-## 项目结构
+![回测结果](assets/backtest_result.png)
+
+---
+
+## 🪙 加密货币策略研究
+
+| 策略 | 文件 | 思路 | 周期 |
+|------|------|------|------|
+| 动量趋势 | `crypto_momentum.py` | MA50 趋势跟踪 + 动量排序 | 日线 |
+| 超短线 | `crypto_short_term.py` | RSI + 布林带 | 15分钟 |
+| 高频剥头皮 | `crypto_scalping.py` | 插针反转 + 成交量确认 | 5分钟 |
+| 多币种并发 | `crypto_multi.py` | 5币并发 + 动态杠杆 | 小时线 |
+
+![多币种回测](assets/crypto_multi.png)
+
+---
+
+## 📁 项目结构
 
 ```
-├── config.py          # 全局配置（股票池大小、因子权重、交易成本）
-├── data_loader.py     # 数据获取（AkShare + 本地缓存）
-├── factors.py         # 因子计算 + 截面标准化
-├── backtest.py        # 回测引擎
-├── analysis.py        # 绩效分析 + 可视化
-├── main.py            # 主入口
-└── README.md
+quant_backtest/
+├── README.md               ← 你在这
+├── LIVE_TRADING.md          ← 实盘交易记录
+├── requirements.txt         ← Python 依赖
+│
+├── bitget_bot.py            ← 🚀 实盘机器人（Bitget API）
+├── main.py                  ← A股回测入口
+├── config.py                ← 全局参数
+│
+├── backtest.py              ← 回测引擎
+├── data_loader.py           ← 数据获取（AkShare/yfinance）
+├── factors.py               ← 因子计算 + 截面标准化
+├── analysis.py              ← 绩效分析 + 可视化
+│
+├── backtest_200.py          ← 200只股票回测
+├── backtest_5m.py           ← 5分钟周期回测
+├── backtest_hourly.py       ← 小时级回测
+├── backtest_current.py      ← 最新参数回测
+│
+├── crypto_momentum.py       ← 币圈动量策略
+├── crypto_short_term.py     ← 币圈超短线
+├── crypto_scalping.py       ← 币圈剥头皮
+├── crypto_multi.py          ← 多币种并发
+├── analyze_wicks.py         ← 插针分析
+│
+├── assets/                  ← 回测图表 & 数据
+└── cache/                   ← 本地数据缓存
 ```
 
-## 快速开始
+---
+
+## ⚡ 快速开始
 
 ```bash
-# 1. 安装依赖
-pip install akshare pandas numpy matplotlib
+# 克隆
+git clone https://github.com/crilicheng/quant-backtest.git
+cd quant-backtest
 
-# 2. 快速模式（50只股票，验证流程）
+# 安装依赖
+pip install -r requirements.txt
+
+# A 股多因子回测（快速模式，50 只股票）
 python main.py --quick
 
-# 3. 完整回测（300只股票）
+# 完整回测（300 只股票）
 python main.py
+
+# 加密货币回测
+python crypto_momentum.py
+
+# 实盘模拟
+python bitget_bot.py --dry-run
 ```
 
-## 输出
+---
 
-- 控制台：绩效指标表（年化收益、夏普、最大回撤、信息比率等）
-- `backtest_result.png`：净值曲线 + 回撤图
-- `backtest_nav.csv`：每日净值数据
-- `backtest_trades.csv`：调仓记录
-- `cache/`：股票数据缓存（避免重复下载）
+## 🔜 路线图
 
-## 改进方向
+- [ ] 实盘净值曲线可视化
+- [ ] 更多因子（质量、成长、一致预期）
+- [ ] 行业中性化
+- [ ] Barra 风险模型
+- [ ] Streamlit 交互式看板
+- [ ] 对接更多交易所（Binance、OKX）
 
-- [ ] 行业中性化（对因子做行业哑变量回归）
-- [ ] 更多因子（质量因子、成长因子、一致预期因子）
-- [ ] 动态因子权重（ICIR 加权）
-- [ ] 风险模型（Barra 结构化风险模型）
-- [ ] 组合优化（均值-方差优化、风险平价）
-- [ ] 实盘接口（对接 QMT/Ptrade）
-- [ ] 因子 IC 值跟踪和因子衰减分析
+---
 
-## 作者
+## 👤 作者
 
-AI 专业学生，量化方向探索中。
+AI 专业大二学生，量化方向探索中。
 
-## 免责声明
+---
 
-本项目仅供学习研究使用，不构成任何投资建议。策略回测收益不代表未来表现。
+## ⚠️ 免责声明
+
+本项目仅供学习研究，**不构成任何投资建议**。回测收益不代表未来表现，加密货币交易风险极高，可能损失全部本金。

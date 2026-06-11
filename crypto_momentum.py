@@ -264,8 +264,8 @@ def run_crypto_backtest(quick: bool = False):
     ax2.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig("crypto_result.png", dpi=150, bbox_inches="tight")
-    print("[Crypto] 图表已保存: crypto_result.png")
+    plt.savefig("assets/crypto_result.png", dpi=150, bbox_inches="tight")
+    print("[Crypto] 图表已保存: assets/crypto_result.png")
 
     print(f"\n{'='*70}")
     print(f"  加密货币动量轮动策略 · 绩效报告")
@@ -292,7 +292,7 @@ def run_crypto_backtest(quick: bool = False):
     print(f"\n  Total: {elapsed:.1f}s")
 
     # 保存
-    nav_df.to_csv("crypto_nav.csv")
+    nav_df.to_csv("assets/crypto_nav.csv")
 
 
 if __name__ == "__main__":

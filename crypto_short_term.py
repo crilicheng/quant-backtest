@@ -254,8 +254,8 @@ def run_short_term(quick: bool = False):
     ax3.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig("crypto_short_term.png", dpi=150, bbox_inches="tight")
-    print("[Short] 图表已保存: crypto_short_term.png")
+    plt.savefig("assets/crypto_short_term.png", dpi=150, bbox_inches="tight")
+    print("[Short] 图表已保存: assets/crypto_short_term.png")
 
     print(f"\n{'='*65}")
     print(f"  BTC 短线 RSI+布林带 · 绩效报告")

@@ -294,8 +294,8 @@ def run_multi(quick=False):
     ax3.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig("crypto_multi.png", dpi=150, bbox_inches="tight")
-    print("[Multi] 图表: crypto_multi.png")
+    plt.savefig("assets/crypto_multi.png", dpi=150, bbox_inches="tight")
+    print("[Multi] 图表: assets/crypto_multi.png")
 
     print(f"\n{'='*60}")
     print(f"  多币种并发 · 绩效报告")

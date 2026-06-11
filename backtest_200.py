@@ -158,6 +158,6 @@ dd=(nav_df["equity"]-nav_df["equity"].expanding().max())/nav_df["equity"].expand
 ax2.fill_between(dd.index,dd.values,0,color="red",alpha=0.3)
 ax2.set_ylabel("回撤");ax2.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1.0));ax2.grid(True,alpha=0.3)
 
-plt.tight_layout();plt.savefig("backtest_200.png",dpi=150,bbox_inches="tight")
+plt.tight_layout();plt.savefig("assets/backtest_200.png",dpi=150,bbox_inches="tight")
 print(f"\n$200 → ${final:,.0f} | 年化{ann*100:.1f}% | 夏普{sharpe:.2f} | 回撤{mdd*100:.1f}% | {len(trades)}笔 | 胜率{wr*100:.0f}% | 插针{wicks}次")
-print("图: backtest_200.png")
+print("图: assets/backtest_200.png")

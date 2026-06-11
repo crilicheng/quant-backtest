@@ -364,8 +364,8 @@ def run_scalping(quick: bool = False):
     ax3.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig("crypto_scalping.png", dpi=150, bbox_inches="tight")
-    print("[Scalp] 图表已保存: crypto_scalping.png")
+    plt.savefig("assets/crypto_scalping.png", dpi=150, bbox_inches="tight")
+    print("[Scalp] 图表已保存: assets/crypto_scalping.png")
 
     print(f"\n{'='*60}")
     print(f"  ETH 杠杆超短线 (10x) · 绩效报告")

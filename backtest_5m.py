@@ -138,5 +138,5 @@ ax2.set_ylabel("每笔盈亏$");ax2.set_xlabel("交易序号")
 ax2.set_title(f"每笔交易盈亏（止盈{wins_tp} 止损{wins_sl}）")
 ax2.grid(True,alpha=0.3,axis='y')
 
-plt.tight_layout();plt.savefig("backtest_5m.png",dpi=150,bbox_inches="tight")
-print("图: backtest_5m.png")
+plt.tight_layout();plt.savefig("assets/backtest_5m.png",dpi=150,bbox_inches="tight")
+print("图: assets/backtest_5m.png")
