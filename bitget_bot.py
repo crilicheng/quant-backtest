@@ -485,7 +485,8 @@ def run(dry=True):
                     api._recovered = True
                     recovered = api.recover_tpsl_oids()
                     for sym, oids in recovered.items():
-                        api._tpsl_oids[sym] = {"sl": oids.get("sl",""), "tp": oids.get("tp","")}
+                        api._tpsl_oids[sym] = {"sl": oids.get("sl",""), "tp": oids.get("tp",""),
+                                               "last_sl_hint": oids.get("last_sl_hint", 0)}
                         if sym in trailing_state:
                             trailing_state[sym]["sl_order_id"] = oids.get("sl", "")
                             trailing_state[sym]["tp_order_id"] = oids.get("tp", "")
@@ -506,13 +507,15 @@ def run(dry=True):
                         if open_price <= 0:
                             continue
                         oids = api._tpsl_oids.get(sym, {})
+                        hard_sl = open_price * (1 - SL if hold_side == "long" else 1 + SL)
+                        last_sl = float(oids.get("last_sl_hint", 0) or hard_sl)
                         trailing_state[sym] = {
                             "side": "buy" if hold_side == "long" else "sell",
                             "entry": open_price,
                             "best": open_price,
                             "sl_order_id": oids.get("sl", ""),
                             "tp_order_id": oids.get("tp", ""),
-                            "last_sl": open_price * (1 - SL if hold_side == "long" else 1 + SL),
+                            "last_sl": last_sl,
                         }
                 # 已平仓的 → 清理残留 TP 计划单 + 移除状态
                 open_syms = {p.get("symbol") for p in pos}
