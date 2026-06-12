@@ -35,8 +35,9 @@ DAILY_LOSS_LIMIT = 0.20    # 日亏20%停机
 CONSECUTIVE_FAILS_MAX = 3  # 连续开仓失败停机
 CONSECUTIVE_ERRORS_MAX = 5 # 连续 API 错误停机
 
+MIN_TRAIL_STEP = 0.001  # SL 改善 < 0.1% 不修改，避免频繁改单
 cooldown = {}          # {symbol: last_entry_ts} 防重复开仓
-trailing_state = {}    # {symbol: {side, entry, best}} 移动止盈追踪
+trailing_state = {}    # {symbol: {side, entry, best, sl_order_id, tp_order_id, last_sl}}
 
 # ==== Bitget ====
 class Bitget:
@@ -45,6 +46,7 @@ class Bitget:
     def __init__(self, dry=True):
         self.dry = dry
         self.stop_trading = False
+        self._tpsl_oids = {}  # {symbol: {"sl": orderId, "tp": orderId}}
         if not dry:
             self.key = os.getenv("BITGET_KEY")
             self.secret = os.getenv("BITGET_SECRET")
@@ -287,6 +289,9 @@ class Bitget:
         tp_ok = tp_r.get("code") == "00000"
 
         if sl_ok and tp_ok:
+            sl_oid = sl_r.get("data", {}).get("orderId", "")
+            tp_oid = tp_r.get("data", {}).get("orderId", "")
+            self._tpsl_oids[symbol] = {"sl": sl_oid, "tp": tp_oid}
             logger.info(f"✅ TP/SL已挂 {symbol}")
             return True
         else:
@@ -300,8 +305,8 @@ class Bitget:
                 logger.error(f"⚠️ {symbol} 平仓也失败！请手动平仓！")
             return False
 
-    def update_trailing_stop(self, symbol, entry_side, entry_price, best_price):
-        """移动止盈：分币种参数，浮盈超激活门槛后止损线跟随最佳价"""
+    def update_trailing_stop(self, symbol, entry_side, entry_price, best_price, sl_order_id):
+        """移动止盈：用 modify-tpsl-order 修改止损单（不裸仓），节流 0.1%"""
         if self.dry:
             return False, best_price
 
@@ -325,7 +330,7 @@ class Bitget:
         if mark_price is None:
             return False, best_price
 
-        # 更新最佳价
+        # 始终更新最佳价（与改单成败无关）
         if entry_side == "buy":
             new_best = max(best_price, mark_price)
             float_pnl = (mark_price - entry_price) / entry_price
@@ -343,35 +348,57 @@ class Bitget:
         else:
             new_sl = round(new_best * (1 + trail_dist), 6)
 
-        # 新止损不能比旧止损差
+        # 新止损不能比硬止损差
         if entry_side == "buy" and new_sl <= entry_price * (1 - SL):
             return False, new_best
         if entry_side == "sell" and new_sl >= entry_price * (1 + SL):
             return False, new_best
 
-        # 取消旧止损单
-        self._post("/api/v2/mix/order/cancel-plan-order",
-                   {"symbol": symbol, "marginCoin": "USDT",
-                    "productType": "USDT-FUTURES", "planType": "loss_plan"})
-        time.sleep(0.5)
+        # 节流：改善不足 0.1% 就不改单
+        if sl_order_id:
+            # 查当前止损单的价格
+            detail = self._get(f"/api/v2/mix/order/detail?symbol={symbol}&productType=USDT-FUTURES&orderId={sl_order_id}")
+            if detail.get("code") == "00000":
+                cur_trigger = float(detail.get("data", {}).get("triggerPrice", 0))
+                if cur_trigger > 0:
+                    if entry_side == "buy":
+                        improvement = (new_sl - cur_trigger) / cur_trigger
+                    else:
+                        improvement = (cur_trigger - new_sl) / cur_trigger
+                    if improvement < MIN_TRAIL_STEP:
+                        return False, new_best
 
-        # 挂新止损单
-        hold_side = "buy" if entry_side == "buy" else "sell"
-        sl_r = self._post("/api/v2/mix/order/place-tpsl-order",
-                          {"symbol": symbol, "marginCoin": "USDT",
-                           "size": str(size), "holdSide": hold_side,
-                           "productType": "USDT-FUTURES",
-                           "triggerType": "mark_price",
-                           "executePrice": "0",
-                           "triggerPrice": str(new_sl),
-                           "planType": "loss_plan"})
-
-        if sl_r.get("code") == "00000":
-            logger.info(f"  🔒 {symbol} 移动止损 → {new_sl} (浮盈{float_pnl:+.2%})")
-            return True, new_best
+        # 修改止损单（不是取消+重挂，无裸仓窗口）
+        if sl_order_id:
+            modify_r = self._post("/api/v2/mix/order/modify-tpsl-order",
+                                  {"symbol": symbol, "marginCoin": "USDT",
+                                   "productType": "USDT-FUTURES",
+                                   "planType": "loss_plan",
+                                   "orderId": str(sl_order_id),
+                                   "triggerPrice": str(new_sl)})
+            if modify_r.get("code") == "00000":
+                logger.info(f"  🔒 {symbol} 移动止损 → {new_sl} (浮盈{float_pnl:+.2%})")
+                return True, new_best
+            else:
+                logger.error(f"  ⚠️ {symbol} 移动止损失败: {modify_r.get('code')} {modify_r.get('msg','')}")
+                return False, new_best
         else:
-            logger.error(f"  ⚠️ {symbol} 移动止损失败: {sl_r.get('code')} {sl_r.get('msg','')}")
-            return False, best_price
+            # 没有 orderId（应极少发生），退化为 place 新止损
+            hold_side = "buy" if entry_side == "buy" else "sell"
+            sl_r = self._post("/api/v2/mix/order/place-tpsl-order",
+                              {"symbol": symbol, "marginCoin": "USDT",
+                               "size": str(size), "holdSide": hold_side,
+                               "productType": "USDT-FUTURES",
+                               "triggerType": "mark_price",
+                               "executePrice": "0",
+                               "triggerPrice": str(new_sl),
+                               "planType": "loss_plan"})
+            if sl_r.get("code") == "00000":
+                logger.info(f"  🔒 {symbol} 移动止损(new) → {new_sl} (浮盈{float_pnl:+.2%})")
+                return True, new_best
+            else:
+                logger.error(f"  ⚠️ {symbol} 移动止损失败: {sl_r.get('code')} {sl_r.get('msg','')}")
+                return False, new_best
 
 
 # ==== 信号 ====
@@ -395,16 +422,18 @@ def price_fmt(p):
 def check_signal(api, symbol):
     df = api.candles(symbol)
     if len(df) < 50: return None
+    # 用 iloc[-2] 取上一根已收完的 K 线，避免当前未完成 K 线的假信号
     c, h, l, v = df["close"], df["high"], df["low"], df["vol"]
-    price = float(c.iloc[-1])
-    rsi = compute_rsi(c)
+    idx = -2 if len(df) >= 2 else -1
+    price = float(c.iloc[idx])
+    rsi = compute_rsi(c.iloc[:idx+1])  # RSI 也只用到已完成 K
     vm = v.rolling(20).mean()
-    vr = float(v.iloc[-1] / vm.iloc[-1]) if vm.iloc[-1] > 0 else 1
+    vr = float(v.iloc[idx] / vm.iloc[idx]) if vm.iloc[idx] > 0 else 1
     if pd.isna(rsi): return None
-    if rsi < RSI_L and vr > MIN_VOL and price > float(l.iloc[-1]) * 1.003:
+    if rsi < RSI_L and vr > MIN_VOL and price > float(l.iloc[idx]) * 1.003:
         logger.info(f"📈 {symbol} LONG  RSI={rsi:.0f} Vol={vr:.1f}x {price_fmt(price)}")
         return {"dir":"long","price":price,"rsi":rsi}
-    if rsi > RSI_S and vr > MIN_VOL and price < float(h.iloc[-1]) * 0.997:
+    if rsi > RSI_S and vr > MIN_VOL and price < float(h.iloc[idx]) * 0.997:
         logger.info(f"📉 {symbol} SHORT RSI={rsi:.0f} Vol={vr:.1f}x {price_fmt(price)}")
         return {"dir":"short","price":price,"rsi":rsi}
     return None
@@ -438,30 +467,52 @@ def run(dry=True):
             # === 移动止盈检查 ===
             if not dry:
                 global trailing_state
+                # 初始化新持仓状态
                 for p in pos:
                     sym = p.get("symbol", "")
                     hold_side = p.get("holdSide", "")
                     if hold_side not in ("long", "short"):
                         continue
-                    # 初始化追踪状态
                     if sym not in trailing_state:
                         open_price = float(p.get("openPriceAvg", 0) or p.get("openPrice", 0))
                         if open_price <= 0:
                             continue
+                        oids = api._tpsl_oids.get(sym, {})
                         trailing_state[sym] = {
                             "side": "buy" if hold_side == "long" else "sell",
                             "entry": open_price,
                             "best": open_price,
+                            "sl_order_id": oids.get("sl", ""),
+                            "tp_order_id": oids.get("tp", ""),
+                            "last_sl": open_price * (1 - SL if hold_side == "long" else 1 + SL),
                         }
-                    state = trailing_state[sym]
-                    updated, new_best = api.update_trailing_stop(
-                        sym, state["side"], state["entry"], state["best"]
-                    )
-                    if updated:
-                        state["best"] = new_best
-                # 清理已平仓的追踪状态
+                # 已平仓的 → 清理残留 TP 计划单 + 移除状态
                 open_syms = {p.get("symbol") for p in pos}
-                trailing_state = {k: v for k, v in trailing_state.items() if k in open_syms}
+                for sym in list(trailing_state.keys()):
+                    if sym not in open_syms:
+                        state = trailing_state.pop(sym)
+                        # 清理残留 TP 计划单
+                        tp_oid = state.get("tp_order_id", "")
+                        if tp_oid:
+                            api._post("/api/v2/mix/order/cancel-plan-order",
+                                      {"symbol": sym, "marginCoin": "USDT",
+                                       "productType": "USDT-FUTURES",
+                                       "orderId": str(tp_oid),
+                                       "planType": "profit_plan"})
+                        sl_oid = state.get("sl_order_id", "")
+                        if sl_oid:
+                            api._post("/api/v2/mix/order/cancel-plan-order",
+                                      {"symbol": sym, "marginCoin": "USDT",
+                                       "productType": "USDT-FUTURES",
+                                       "orderId": str(sl_oid),
+                                       "planType": "loss_plan"})
+                # 移动止盈
+                for sym, state in list(trailing_state.items()):
+                    updated, new_best = api.update_trailing_stop(
+                        sym, state["side"], state["entry"], state["best"],
+                        state.get("sl_order_id", "")
+                    )
+                    state["best"] = new_best  # 始终更新 best，与改单成败无关
 
             # === 扫描信号 ===
             if len(pos) < MAX_POSITIONS:
@@ -504,6 +555,11 @@ def run(dry=True):
                                 fail_streak = 0
                                 margin = notional / lev
                                 logger.info(f"✅ {coin} {sig['dir']} 名义${notional:.0f} {lev}x保证金${margin:.0f} 风险${risk_dollar:.0f} {price_fmt(price)}→止盈{price_fmt(tp_price)} 止损{price_fmt(sl_price)}")
+                                # 存储 TP/SL orderId 到追踪状态
+                                oids = api._tpsl_oids.get(coin, {})
+                                if coin in trailing_state:
+                                    trailing_state[coin]["sl_order_id"] = oids.get("sl", "")
+                                    trailing_state[coin]["tp_order_id"] = oids.get("tp", "")
                                 # 刷新持仓 + cooldown 防重复
                                 pos = api.positions()
                                 cooldown[coin] = time.time()
