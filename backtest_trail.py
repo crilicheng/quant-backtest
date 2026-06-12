@@ -1,17 +1,34 @@
 """
-RSI 均值回归策略回测 — 对比移动止盈 vs 固定止盈止损
+RSI 均值回归回测 — 独立复核版
+- 信号用已收 K → 下K open入场 → SL优先 → 同K不移止 → 0.08%费
+- 组合回测：最多3仓，权益复利，<$20停开
 用法: python backtest_trail.py
 """
 import numpy as np, pandas as pd, yfinance as yf
 
-# === 与实盘一致的参数 ===
-RSI_P = 5; RSI_L = 25; RSI_S = 78; MIN_VOL = 1.2
-TP = 0.015          # 止盈 1.5%
-SL = 0.004          # 硬止损 / 移动止盈距离 0.4%
-ACTIVATE = 0.006    # 浮盈超过 0.6% 才启动移动止盈
-PERIOD = "3mo"      # 回测周期
-INTERVAL = "1h"     # K线周期
+FEE = 0.0008; MAX_POS = 3; MIN_EQUITY = 20
+PERIOD = "1y"; INTERVAL = "1h"
+RSI_P = 5
 COINS = ["ETH-USD","SOL-USD","BNB-USD","AVAX-USD","DOGE-USD"]
+
+# === 三个候选方案 ===
+CONFIGS = {
+    "A-稳健": {
+        "RSI_L": 20, "RSI_S": 82, "MIN_VOL": 1.5,
+        "TP": 0.025, "SL": 0.006, "WICK": 0.003,
+        "activate": 0.006, "trail": 0.003,
+    },
+    "B-激进": {
+        "RSI_L": 25, "RSI_S": 78, "MIN_VOL": 1.2,
+        "TP": 0.022, "SL": 0.004, "WICK": 0.003,
+        "activate": 0.010, "trail": 0.0025,
+    },
+    "当前": {
+        "RSI_L": 25, "RSI_S": 78, "MIN_VOL": 1.2,
+        "TP": 0.015, "SL": 0.004, "WICK": 0.003,
+        "activate": 0.006, "trail": 0.003,
+    },
+}
 
 def compute_rsi(close, period=RSI_P):
     d = close.diff().dropna()
@@ -22,144 +39,183 @@ def compute_rsi(close, period=RSI_P):
     if al.iloc[-1] == 0: return 100.0 if ag.iloc[-1] > 0 else 50.0
     return float(100 - 100 / (1 + ag.iloc[-1] / al.iloc[-1]))
 
-def backtest(df, use_trail=False):
-    """返回 trades 列表, 每笔 {'pnl%','reason'}"""
-    c, h, l, v = df["Close"], df["High"], df["Low"], df["Volume"]
+
+def run_portfolio(df_dict, p, use_trail=False):
+    """p = param dict from CONFIGS"""
     trades = []
-    pos = None  # {'dir','entry','tp','sl','best'}
+    equity = 100.0
+    nav = [100.0]
+    dd = [0.0]
+    peak = 100.0
+    positions = []
+    max_len = max(len(df) for df in df_dict.values())
 
-    for i in range(50, len(df)-1):
-        price = float(c.iloc[i])
-        hi = float(h.iloc[i]); lo = float(l.iloc[i])
+    for i in range(50, max_len - 2):
+        # === 离场 ===
+        survived = []
+        for pos in positions:
+            sym = pos['sym']
+            if i >= len(df_dict[sym]) - 1:
+                continue
+            hi = float(df_dict[sym]["High"].iloc[i])
+            lo = float(df_dict[sym]["Low"].iloc[i])
 
-        # ── 检查离场 ──
-        if pos:
             if pos['dir'] == 'long':
-                # 止盈
-                if hi >= pos['tp']:
-                    trades.append({'pnl%': TP, 'reason': 'tp'})
-                    pos = None; continue
-                # 更新最佳价
-                if hi > pos['best']: pos['best'] = hi
+                pos['_prev_best'] = pos.get('_curr_best', pos['best'])
+                pos['_curr_best'] = max(pos['best'], hi)
+            else:
+                pos['_prev_best'] = pos.get('_curr_best', pos['best'])
+                pos['_curr_best'] = min(pos['best'], lo)
 
-                if use_trail:
-                    # 浮盈超过激活门槛后才启动移动止盈
-                    float_pnl = (pos['best'] - pos['entry']) / pos['entry']
-                    if float_pnl >= ACTIVATE:
-                        # 已激活：止损线跟随最高价 -0.4%
-                        sl = pos['best'] * (1 - SL)
-                        if lo <= sl:
-                            pnl = (sl - pos['entry']) / pos['entry']
-                            trades.append({'pnl%': pnl, 'reason': 'trail'})
-                            pos = None; continue
-                    else:
-                        # 未激活：保留硬止损
-                        if lo <= pos['sl']:
-                            trades.append({'pnl%': -SL, 'reason': 'sl'})
-                            pos = None; continue
+            exit_px = None; exit_reason = None
+
+            # SL 优先
+            if pos['dir'] == 'long':
+                if lo <= pos['sl']: exit_px = pos['sl']; exit_reason = 'sl'
+            else:
+                if hi >= pos['sl']: exit_px = pos['sl']; exit_reason = 'sl'
+
+            # TP
+            if exit_px is None:
+                if pos['dir'] == 'long':
+                    if hi >= pos['tp']: exit_px = pos['tp']; exit_reason = 'tp'
                 else:
-                    # 无移动止盈：固定止损
-                    if lo <= pos['sl']:
-                        trades.append({'pnl%': -SL, 'reason': 'sl'})
-                        pos = None; continue
-            else:  # short
-                if lo <= pos['tp']:
-                    trades.append({'pnl%': TP, 'reason': 'tp'})
-                    pos = None; continue
-                if lo < pos['best']: pos['best'] = lo
+                    if lo <= pos['tp']: exit_px = pos['tp']; exit_reason = 'tp'
 
-                if use_trail:
-                    float_pnl = (pos['entry'] - pos['best']) / pos['entry']
-                    if float_pnl >= ACTIVATE:
-                        sl = pos['best'] * (1 + SL)
-                        if hi >= sl:
-                            pnl = (pos['entry'] - sl) / pos['entry']
-                            trades.append({'pnl%': pnl, 'reason': 'trail'})
-                            pos = None; continue
-                    else:
-                        if hi >= pos['sl']:
-                            trades.append({'pnl%': -SL, 'reason': 'sl'})
-                            pos = None; continue
+            # 移止（用 prev_best 避免同K先涨后跌）
+            if exit_px is None and use_trail:
+                prev_best = pos.get('_prev_best', pos['best'])
+                if pos['dir'] == 'long':
+                    fp = (prev_best - pos['entry_px']) / pos['entry_px']
+                    if fp >= p['activate']:
+                        ts = prev_best * (1 - p['trail'])
+                        if lo <= ts: exit_px = ts; exit_reason = 'trail'
                 else:
-                    if hi >= pos['sl']:
-                        trades.append({'pnl%': -SL, 'reason': 'sl'})
-                        pos = None; continue
+                    fp = (pos['entry_px'] - prev_best) / pos['entry_px']
+                    if fp >= p['activate']:
+                        ts = prev_best * (1 + p['trail'])
+                        if hi >= ts: exit_px = ts; exit_reason = 'trail'
 
-        # ── 检查入场 ──
-        if pos is None:
-            rsi = compute_rsi(c.iloc[max(0,i-50):i+1])
-            vm = v.iloc[max(0,i-20):i+1].mean()
-            vr = float(v.iloc[i] / vm) if vm > 0 else 1
+            if exit_px:
+                if pos['dir'] == 'long':
+                    gross = (exit_px - pos['entry_px']) / pos['entry_px']
+                else:
+                    gross = (pos['entry_px'] - exit_px) / pos['entry_px']
+                pnl = gross - FEE
+                trades.append({
+                    'sym': sym, 'dir': pos['dir'],
+                    'entry_px': pos['entry_px'], 'exit_px': exit_px,
+                    'pnl_net': pnl, 'reason': exit_reason,
+                    'half': 1 if i < max_len // 2 else 2,
+                })
+                equity *= (1 + pnl)
+            else:
+                pos['best'] = pos.get('_prev_best', pos['best'])
+                survived.append(pos)
 
-            if rsi < RSI_L and vr > MIN_VOL and price > lo * 1.003:
-                tp_price = price * (1 + TP)
-                sl_price = price * (1 - SL)
-                pos = {'dir': 'long', 'entry': price, 'tp': tp_price, 'sl': sl_price, 'best': price}
-            elif rsi > RSI_S and vr > MIN_VOL and price < hi * 0.997:
-                tp_price = price * (1 - TP)
-                sl_price = price * (1 + SL)
-                pos = {'dir': 'short', 'entry': price, 'tp': tp_price, 'sl': sl_price, 'best': price}
+        positions = survived
+        nav.append(equity)
+        if equity > peak: peak = equity
+        dd.append((equity - peak) / peak)
 
-    return trades
+        # === 入场 ===
+        if len(positions) >= MAX_POS or equity < MIN_EQUITY:
+            continue
+
+        for sym, df in df_dict.items():
+            if len(positions) >= MAX_POS or equity < MIN_EQUITY:
+                break
+            if i >= len(df) - 2: continue
+            if any(p['sym'] == sym for p in positions): continue
+
+            c_win = df["Close"].iloc[max(0,i-50):i+1]
+            price = float(df["Close"].iloc[i])
+            hi = float(df["High"].iloc[i])
+            lo = float(df["Low"].iloc[i])
+            v_win = df["Volume"].iloc[max(0,i-20):i+1]
+
+            rsi = compute_rsi(c_win)
+            vm = v_win.mean()
+            vr = float(v_win.iloc[-1] / vm) if vm > 0 else 1
+
+            sig = None
+            # Wick filter: close must be beyond low/high by wick%
+            if rsi < p['RSI_L'] and vr > p['MIN_VOL'] and price > lo * (1 + p['WICK']):
+                sig = 'long'
+            elif rsi > p['RSI_S'] and vr > p['MIN_VOL'] and price < hi * (1 - p['WICK']):
+                sig = 'short'
+
+            if sig:
+                entry_px = float(df["Open"].iloc[i + 1])
+                if sig == 'long':
+                    sl_px = entry_px * (1 - p['SL'])
+                    tp_px = entry_px * (1 + p['TP'])
+                else:
+                    sl_px = entry_px * (1 + p['SL'])
+                    tp_px = entry_px * (1 - p['TP'])
+
+                positions.append({
+                    'sym': sym, 'dir': sig,
+                    'entry_px': entry_px, 'sl': sl_px, 'tp': tp_px,
+                    'best': entry_px,
+                })
+
+    # 计算 max_dd
+    peak = 100.0; max_dd = 0.0
+    for v in nav:
+        if v > peak: peak = v
+        d = (v - peak) / peak
+        if d < max_dd: max_dd = d
+
+    return trades, nav, max_dd
 
 
-def stats(trades):
-    """汇总统计"""
-    if not trades: return {}
-    wins = [t['pnl%'] for t in trades if t['pnl%'] > 0]
-    losses = [t['pnl%'] for t in trades if t['pnl%'] <= 0]
+def summary(label, trades, nav, max_dd):
+    if not trades: return None
+    wins = [t['pnl_net'] for t in trades if t['pnl_net'] > 0]
+    losses = [t['pnl_net'] for t in trades if t['pnl_net'] <= 0]
+    from collections import Counter
+    rc = Counter(t['reason'] for t in trades)
+
+    t1 = [t for t in trades if t['half'] == 1]
+    t2 = [t for t in trades if t['half'] == 2]
+    half1 = sum(t['pnl_net'] for t in t1) * 100 if t1 else 0
+    half2 = sum(t['pnl_net'] for t in t2) * 100 if t2 else 0
+
     return {
+        'name': label,
         'count': len(trades),
         'wr': len(wins)/len(trades)*100,
         'avg_win': np.mean(wins)*100 if wins else 0,
         'avg_loss': np.mean(losses)*100 if losses else 0,
-        'net': sum(t['pnl%'] for t in trades)*100,
-        'rr': abs(np.mean(wins)/np.mean(losses)) if wins and losses else 0,
-        'tp': sum(1 for t in trades if t['reason']=='tp'),
-        'sl': sum(1 for t in trades if t['reason']=='sl'),
-        'trail': sum(1 for t in trades if t['reason']=='trail'),
+        'net': sum(t['pnl_net'] for t in trades)*100,
+        'final': nav[-1],
+        'max_dd': max_dd * 100,
+        'half1': half1,
+        'half2': half2,
+        'tp': rc.get('tp', 0), 'sl': rc.get('sl', 0), 'trail': rc.get('trail', 0),
     }
 
 
 if __name__ == "__main__":
-    print("=" * 90)
-    print(f"  RSI 均值回归回测 | {PERIOD} {INTERVAL} | TP={TP:.1%} SL={SL:.1%} 激活={ACTIVATE:.1%}")
-    print("=" * 90)
-    print(f"{'币种':<10} {'模式':<8} {'交易数':>5} {'胜率':>6} {'均盈':>7} {'均亏':>7} {'净利':>7} {'盈亏比':>6}  {'明细'}")
+    # 加载数据
+    df_dict = {}
+    for sym in COINS:
+        df = yf.Ticker(sym).history(period=PERIOD, interval=INTERVAL)
+        if len(df) > 100:
+            df_dict[sym] = df
+    print(f"数据: {PERIOD} {INTERVAL}, {len(df_dict)} coins\n")
+
+    header = f"{'方案':<10} {'交易':>5} {'胜率':>6} {'均盈':>7} {'均亏':>7} {'净利':>8} {'终值':>7} {'最大回撤':>7} {'前半':>7} {'后半':>7}"
+    print(header)
     print("-" * 90)
 
-    all_no = []; all_yes = []
+    for name, p in CONFIGS.items():
+        for use_trail, trail_label in [(False, ""), (True, "+移止")]:
+            label = f"{name}{trail_label}"
+            trades, nav, max_dd = run_portfolio(df_dict, p, use_trail)
+            s = summary(label, trades, nav, max_dd)
+            if s:
+                print(f"  {s['name']:<10} {s['count']:>5} {s['wr']:>5.0f}% {s['avg_win']:>6.2f}% {s['avg_loss']:>6.2f}% {s['net']:>7.2f}% {s['final']:>6.1f} {s['max_dd']:>6.2f}% {s['half1']:>+6.2f}% {s['half2']:>+6.2f}%  TP{s['tp']}/SL{s['sl']}/移{s['trail']}")
 
-    for symbol in COINS:
-        try:
-            df = yf.Ticker(symbol).history(period=PERIOD, interval=INTERVAL)
-            if len(df) < 100:
-                print(f"{symbol:<10} 数据不足")
-                continue
-
-            for label, use_trail in [("无移动", False), ("移止", True)]:
-                t = backtest(df, use_trail)
-                if not t: continue
-                s = stats(t)
-                detail = f"止盈{s['tp']}/止损{s['sl']}"
-                if s['trail']: detail += f"/移止{s['trail']}"
-                print(f"{symbol:<10} {label:<8} {s['count']:>5} {s['wr']:>5.0f}% {s['avg_win']:>6.2f}% {s['avg_loss']:>6.2f}% {s['net']:>6.2f}% {s['rr']:>5.1f}  {detail}")
-
-                if use_trail: all_yes.extend(t)
-                else: all_no.extend(t)
-        except Exception as e:
-            print(f"{symbol:<10} 错误: {e}")
-
-    # 合计
-    print("-" * 90)
-    for label, trades in [("无移动止盈", all_no), ("移动止盈  ", all_yes)]:
-        if not trades: continue
-        s = stats(trades)
-        detail = f"止盈{s['tp']}/止损{s['sl']}"
-        if s['trail']: detail += f"/移止{s['trail']}"
-        emoji = "⭐" if "移" in label else "  "
-        print(f"{emoji} {'合计':<8} {label:<8} {s['count']:>5} {s['wr']:>5.0f}% {s['avg_win']:>6.2f}% {s['avg_loss']:>6.2f}% {s['net']:>6.2f}% {s['rr']:>5.1f}  {detail}")
-
-    print()
-    print("  硬止损 = -0.4% 始终有效")
-    print("  移止 = 浮盈 > 0.6% 激活，回撤 0.4% 平仓保利")
+    print(f"\n  标准: 信号已收K → 下K open入场 → SL优先 → 同K不移止 → 0.08%费 → wick过滤")
