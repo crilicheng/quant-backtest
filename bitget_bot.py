@@ -18,6 +18,13 @@ LEVERAGE = 100
 RISK = 0.03
 TP = 0.015
 SL = 0.004
+TRAIL_CONFIG = {        # 分币种移动止盈参数（1年回测验证）
+    "ETHUSDT":  {"activate": 0.004, "trail": 0.003},
+    "SOLUSDT":  {"activate": 0.006, "trail": 0.003},
+    "BNBUSDT":  {"activate": 0.004, "trail": 0.003},
+    "AVAXUSDT": {"activate": 0.010, "trail": 0.003},
+    "DOGEUSDT": {"activate": 0.006, "trail": 0.003},
+}
 RSI_P = 5; RSI_L = 25; RSI_S = 78; MIN_VOL = 1.2
 MAX_POSITIONS = 3
 COINS = ["ETHUSDT", "SOLUSDT", "BNBUSDT", "AVAXUSDT", "DOGEUSDT"]
@@ -28,7 +35,8 @@ DAILY_LOSS_LIMIT = 0.20    # 日亏20%停机
 CONSECUTIVE_FAILS_MAX = 3  # 连续开仓失败停机
 CONSECUTIVE_ERRORS_MAX = 5 # 连续 API 错误停机
 
-cooldown = {}  # {symbol: last_entry_ts} 防重复开仓
+cooldown = {}          # {symbol: last_entry_ts} 防重复开仓
+trailing_state = {}    # {symbol: {side, entry, best}} 移动止盈追踪
 
 # ==== Bitget ====
 class Bitget:
@@ -292,6 +300,79 @@ class Bitget:
                 logger.error(f"⚠️ {symbol} 平仓也失败！请手动平仓！")
             return False
 
+    def update_trailing_stop(self, symbol, entry_side, entry_price, best_price):
+        """移动止盈：分币种参数，浮盈超激活门槛后止损线跟随最佳价"""
+        if self.dry:
+            return False, best_price
+
+        cfg = TRAIL_CONFIG.get(symbol, {"activate": 0.006, "trail": 0.003})
+        activate = cfg["activate"]
+        trail_dist = cfg["trail"]
+
+        # 查当前持仓 & 标记价
+        pos_r = self._get(
+            f"/api/v2/mix/position/all-position?productType=USDT-FUTURES&marginCoin=USDT"
+        )
+        if pos_r.get("code") != "00000":
+            return False, best_price
+
+        mark_price = None; size = None
+        for p in pos_r.get("data", []):
+            if p.get("symbol") == symbol and float(p.get("total", 0)) > 0:
+                mark_price = float(p.get("markPrice", 0))
+                size = p.get("total")
+                break
+        if mark_price is None:
+            return False, best_price
+
+        # 更新最佳价
+        if entry_side == "buy":
+            new_best = max(best_price, mark_price)
+            float_pnl = (mark_price - entry_price) / entry_price
+        else:
+            new_best = min(best_price, mark_price)
+            float_pnl = (entry_price - mark_price) / entry_price
+
+        # 浮盈不足激活门槛 → 不移动
+        if float_pnl < activate:
+            return False, new_best
+
+        # 计算新止损价
+        if entry_side == "buy":
+            new_sl = round(new_best * (1 - trail_dist), 6)
+        else:
+            new_sl = round(new_best * (1 + trail_dist), 6)
+
+        # 新止损不能比旧止损差
+        if entry_side == "buy" and new_sl <= entry_price * (1 - SL):
+            return False, new_best
+        if entry_side == "sell" and new_sl >= entry_price * (1 + SL):
+            return False, new_best
+
+        # 取消旧止损单
+        self._post("/api/v2/mix/order/cancel-plan-order",
+                   {"symbol": symbol, "marginCoin": "USDT",
+                    "productType": "USDT-FUTURES", "planType": "loss_plan"})
+        time.sleep(0.5)
+
+        # 挂新止损单
+        hold_side = "buy" if entry_side == "buy" else "sell"
+        sl_r = self._post("/api/v2/mix/order/place-tpsl-order",
+                          {"symbol": symbol, "marginCoin": "USDT",
+                           "size": str(size), "holdSide": hold_side,
+                           "productType": "USDT-FUTURES",
+                           "triggerType": "mark_price",
+                           "executePrice": "0",
+                           "triggerPrice": str(new_sl),
+                           "planType": "loss_plan"})
+
+        if sl_r.get("code") == "00000":
+            logger.info(f"  🔒 {symbol} 移动止损 → {new_sl} (浮盈{float_pnl:+.2%})")
+            return True, new_best
+        else:
+            logger.error(f"  ⚠️ {symbol} 移动止损失败: {sl_r.get('code')} {sl_r.get('msg','')}")
+            return False, best_price
+
 
 # ==== 信号 ====
 def compute_rsi(close, period=RSI_P):
@@ -353,6 +434,34 @@ def run(dry=True):
                     logger.error(f"连续开仓失败 {fail_streak} 次 停机"); break
                 if error_streak >= CONSECUTIVE_ERRORS_MAX:
                     logger.error(f"连续 API 错误 {error_streak} 次 停机"); break
+
+            # === 移动止盈检查 ===
+            if not dry:
+                global trailing_state
+                for p in pos:
+                    sym = p.get("symbol", "")
+                    hold_side = p.get("holdSide", "")
+                    if hold_side not in ("long", "short"):
+                        continue
+                    # 初始化追踪状态
+                    if sym not in trailing_state:
+                        open_price = float(p.get("openPriceAvg", 0) or p.get("openPrice", 0))
+                        if open_price <= 0:
+                            continue
+                        trailing_state[sym] = {
+                            "side": "buy" if hold_side == "long" else "sell",
+                            "entry": open_price,
+                            "best": open_price,
+                        }
+                    state = trailing_state[sym]
+                    updated, new_best = api.update_trailing_stop(
+                        sym, state["side"], state["entry"], state["best"]
+                    )
+                    if updated:
+                        state["best"] = new_best
+                # 清理已平仓的追踪状态
+                open_syms = {p.get("symbol") for p in pos}
+                trailing_state = {k: v for k, v in trailing_state.items() if k in open_syms}
 
             # === 扫描信号 ===
             if len(pos) < MAX_POSITIONS:
