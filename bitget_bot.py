@@ -405,7 +405,8 @@ def check_signal(api, symbol):
 def run(dry=True):
     api = Bitget(dry=dry)
     bal = api.balance()
-    start_equity_for_dd = bal.get("equity", bal["available"])  # 日亏按权益算
+    start_equity_for_dd = bal["available"]  # 当日初始余额，每天 0 点刷新
+    today = time.localtime().tm_yday        # 一年中的第几天
     logger.info(f"余额: ${bal['available']:.0f} | 持仓: {len(api.positions())} | 扫描: {SCAN_INTERVAL}s")
     count = 0; error_streak = 0
     restart_delay = 60  # 非致命停机后等待 60s 自动重启
@@ -415,12 +416,20 @@ def run(dry=True):
             pos = api.positions()
             bal = api.balance()
 
+            # === 日亏重置（每天 0 点刷新基准） ===
+            if not dry:
+                cur_day = time.localtime().tm_yday
+                if cur_day != today:
+                    start_equity_for_dd = bal["available"]
+                    today = cur_day
+                    logger.info(f"📅 新的一天，日亏基准重置为 ${start_equity_for_dd:.0f}")
+
             # === 风控 kill switch ===
             if not dry:
                 if api.stop_trading:
                     logger.error("触发停机保护，停止开新仓")
                     return  # 不可重启
-                daily_dd = (bal.get("equity", bal["available"]) - start_equity_for_dd) / start_equity_for_dd if start_equity_for_dd > 0 else 0
+                daily_dd = (bal["available"] - start_equity_for_dd) / start_equity_for_dd if start_equity_for_dd > 0 else 0
                 if daily_dd < -DAILY_LOSS_LIMIT:
                     logger.error(f"日亏 {daily_dd:.1%} > {DAILY_LOSS_LIMIT:.0%} 停机")
                     return  # 不可重启
