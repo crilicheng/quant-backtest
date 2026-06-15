@@ -20,10 +20,10 @@ COINS = ["ETH-USD","SOL-USD","BNB-USD","AVAX-USD","DOGE-USD"]
 TRAIL_UNIFIED = {s: {"activate": 0.006, "trail": 0.003} for s in COINS}
 TRAIL_PERCOIN = {
     "ETH-USD":  {"activate": 0.006, "trail": 0.003},
-    "SOL-USD":  {"activate": 0.015, "trail": 0.002},
-    "BNB-USD":  {"activate": 0.004, "trail": 0.002},
-    "AVAX-USD": {"activate": 0.006, "trail": 0.002},
-    "DOGE-USD": {"activate": 0.012, "trail": 0.002},
+    "SOL-USD":  {"activate": 0.015, "trail": 0.003},
+    "BNB-USD":  {"activate": 0.004, "trail": 0.003},
+    "AVAX-USD": {"activate": 0.006, "trail": 0.003},
+    "DOGE-USD": {"activate": 0.012, "trail": 0.003},
 }
 
 def compute_rsi(close, period=RSI_P):
