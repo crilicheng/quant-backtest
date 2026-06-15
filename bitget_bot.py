@@ -37,6 +37,7 @@ CONSECUTIVE_ERRORS_MAX = 5 # 连续 API 错误停机（自动重启）
 
 MIN_TRAIL_STEP = 0.001  # SL 改善 < 0.1% 不修改，避免频繁改单
 cooldown = {}          # {symbol: last_entry_ts} 防重复开仓
+tpsl_fails = {}        # {symbol: count} TP/SL连续失败计数，>3次拉黑5分钟
 trailing_state = {}    # {symbol: {side, entry, best, sl_order_id, tp_order_id, last_sl}}
 
 # ==== Bitget ====
@@ -187,8 +188,8 @@ class Bitget:
         logger.error(f"{symbol} 紧急平仓: {close_r.get('code')} {close_r.get('msg','')}")
         return close_r.get("code") == "00000"
 
-    def open_with_tpsl(self, symbol, side, size, tp, sl_price):
-        """市价单开仓 → 确认成交 → 挂TP/SL。失败则平仓返回False"""
+    def open_with_tpsl(self, symbol, side, size, price, tp, sl_price):
+        """市价单开仓 → 用实际成交价重算TP/SL → 挂单"""
         if self.dry:
             logger.info(f"  [模拟] {side} {size} 市价 {symbol}")
             return True
@@ -202,81 +203,78 @@ class Bitget:
             logger.error(f"市价单失败 {symbol}: {r.get('code')} {r.get('msg','')}")
             return False
 
-        # 2. 等成交（市价单通常秒成交，最多等15秒）
         order_id = r.get("data", {}).get("orderId", "")
-        if not order_id:
-            logger.error(f"{symbol} 市价单未获取订单ID，执行保护性紧急平仓")
-            self._emergency_close(symbol, side, size)
-            return False
-        filled_qty = 0.0
+        if not order_id: logger.error("未获取订单ID"); return False
+
+        # 2. 等成交 + 拿实际成交价
+        fill_price = 0.0; filled_qty = 0.0
         for _ in range(5):
             time.sleep(3)
-            check = self._get(f"/api/v2/mix/order/detail?symbol={symbol}&productType=USDT-FUTURES&orderId={order_id}")
-            if check.get("code") == "00000":
-                data = check.get("data", {})
+            chk = self._get(f"/api/v2/mix/order/detail?symbol={symbol}&productType=USDT-FUTURES&orderId={order_id}")
+            if chk.get("code") == "00000":
+                data = chk.get("data", {})
                 if data.get("state") in ("filled", "partially_filled"):
                     filled_qty = float(data.get("baseVolume", 0))
+                    fill_price = float(data.get("priceAvg", 0))
                     break
-        # 订单详情查不到时，直接用持仓反查（市价单可能已成交但 detail 延迟）
         if filled_qty <= 0:
-            real_qty, real_side = self._position_for_symbol(symbol)
+            # detail 延迟 → 用持仓反查
+            real_qty, _ = self._position_for_symbol(symbol)
             if real_qty > 0:
                 filled_qty = real_qty
-                logger.info(f"{symbol} order/detail 未返回，但持仓已存在 {real_qty} 张")
+                fill_price = float(self._get(
+                    f"/api/v2/mix/position/all-position?productType=USDT-FUTURES&marginCoin=USDT"
+                ).get("data", [{}])[0].get("openPriceAvg", 0))
         if filled_qty <= 0:
-            logger.error(f"{symbol} 市价单成交状态未知，执行保护性紧急平仓")
-            self._emergency_close(symbol, side, size)
+            logger.error(f"{symbol} 市价单未成交")
             return False
 
-        # 3. 确认持仓（重试 + 备用查询）
+        # 3. 用实际成交价重算 TP/SL（关键修复）
+        prec = PREC_MAP.get(symbol, 2)
+        if side == "buy":
+            sl_px = round(fill_price * (1 - SL), prec)
+            tp_px = round(fill_price * (1 + TP), prec)
+        else:
+            sl_px = round(fill_price * (1 + SL), prec)
+            tp_px = round(fill_price * (1 - TP), prec)
+        logger.info(f"  {symbol} 成交价{fill_price} TP/SL基于成交价: TP={tp_px} SL={sl_px}")
+
+        # 4. 确认持仓
+        time.sleep(2)
         actual_size, hold_side = self._position_for_symbol(symbol)
         if actual_size <= 0:
-            # 重试一次 position/all-position
-            time.sleep(3)
-            pos_r = self._get("/api/v2/mix/position/all-position?productType=USDT-FUTURES&marginCoin=USDT")
-            if pos_r.get("code") == "00000":
-                for p in pos_r.get("data", []):
-                    if p.get("symbol") == symbol and float(p.get("total", 0)) > 0:
-                        actual_size = float(p.get("total", 0))
-                        hold_side = p.get("holdSide", "long")
-                        break
-        if actual_size <= 0:
-            # 仍无持仓 → 立即平掉可能的残留
-            logger.error(f"{symbol} 开仓后无持仓，紧急平仓检查")
-            self._emergency_close(symbol, side, size)
+            logger.error(f"{symbol} 开仓后无持仓！")
             return False
 
-        # 5. 挂 TP/SL — 只用必要字段
+        # 5. 挂 TP/SL
         close_side = "sell" if hold_side == "long" else "buy"
         tpsl_body = {"symbol":symbol,"marginCoin":"USDT","size":str(actual_size),
-                     "holdSide": hold_side,
+                     "holdSide": "buy" if hold_side == "long" else "sell",
                      "productType":"USDT-FUTURES","planType":"loss_plan",
-                     "triggerType":"mark_price","executePrice":"0"}
+                     "triggerType":"mark_price"}
 
         sl_r = self._post("/api/v2/mix/order/place-tpsl-order",
-                         {**tpsl_body,"triggerPrice":str(sl_price),"planType":"loss_plan"})
+                         {**tpsl_body,"triggerPrice":str(sl_px),"planType":"loss_plan"})
         tpsl_body["planType"] = "profit_plan"
         tp_r = self._post("/api/v2/mix/order/place-tpsl-order",
-                         {**tpsl_body,"triggerPrice":str(tp)})
+                         {**tpsl_body,"triggerPrice":str(tp_px)})
 
         sl_ok = sl_r.get("code") == "00000"
         tp_ok = tp_r.get("code") == "00000"
 
         if sl_ok and tp_ok:
+            tpsl_fails.pop(symbol, None)
             sl_oid = sl_r.get("data", {}).get("orderId", "")
             tp_oid = tp_r.get("data", {}).get("orderId", "")
             self._tpsl_oids[symbol] = {"sl": sl_oid, "tp": tp_oid}
             logger.info(f"✅ TP/SL已挂 {symbol} sl={sl_oid} tp={tp_oid}")
             return True
         else:
-            # 挂不上 → 立即平仓
             logger.error(f"❌ {symbol} TP/SL失败 止盈{tp_r.get('code')} 止损{sl_r.get('code')} → 平仓!")
             close = self._post("/api/v2/mix/order/place-order",
                                {"symbol":symbol,"marginCoin":"USDT","side":close_side,
                                 "orderType":"market","size":str(actual_size),"reduceOnly":"YES",
                                 "productType":"USDT-FUTURES","marginMode":"crossed"})
-            if close.get("code") != "00000":
-                logger.error(f"⚠️ {symbol} 平仓也失败！请手动平仓！")
             return False
 
     def update_trailing_stop(self, symbol, entry_side, entry_price, best_price,
@@ -351,7 +349,6 @@ class Bitget:
                                "planType": "loss_plan",
                                "orderId": str(sl_order_id),
                                "triggerPrice": str(new_sl),
-                               "executePrice": "0",
                                "triggerType": "mark_price",
                                "size": str(size or "")})
         if modify_r.get("code") == "00000":
@@ -557,6 +554,13 @@ def run(dry=True):
                         logger.warning(f"⚠️ {coin} trailing_state 残留，跳过开仓 (entry={trailing_state[coin].get('entry')})")
                         continue
 
+                    # TP/SL 连续失败拉黑检查
+                    if tpsl_fails.get(coin, 0) >= 99:
+                        if time.time() - cooldown.get(coin, 0) < 300:
+                            continue  # 还在5分钟黑名单内
+                        else:
+                            tpsl_fails[coin] = 0  # 5分钟过了，重置
+
                     sig = check_signal(api, coin)
                     if sig:
                         price = sig["price"]
@@ -575,7 +579,7 @@ def run(dry=True):
                             prec = PREC_MAP.get(coin, 2)
                             tp_price = round(tp_price, prec)
                             sl_price = round(sl_price, prec)
-                            ok = api.open_with_tpsl(coin, side, size, tp_price, sl_price)
+                            ok = api.open_with_tpsl(coin, side, size, price, tp_price, sl_price)
                             if ok:
                                 margin = notional / lev
                                 logger.info(f"✅ {coin} {sig['dir']} 名义${notional:.0f} {lev}x保证金${margin:.0f} 风险${risk_dollar:.0f} {price_fmt(price)}→止盈{price_fmt(tp_price)} 止损{price_fmt(sl_price)}")
@@ -588,8 +592,12 @@ def run(dry=True):
                                 pos = api.positions()
                                 cooldown[coin] = time.time()
                             else:
-                                logger.error(f"❌ {coin} 开仓失败")
+                                tpsl_fails[coin] = tpsl_fails.get(coin, 0) + 1
+                                logger.error(f"❌ {coin} 开仓失败 (TP/SL失败{tpsl_fails[coin]}次)")
                                 cooldown[coin] = time.time()
+                                if tpsl_fails[coin] >= 3:
+                                    tpsl_fails[coin] = 99  # 标记为黑名单
+                                    logger.error(f"🚫 {coin} 拉黑5分钟")
                         time.sleep(1)
 
             count += 1; error_streak = 0
